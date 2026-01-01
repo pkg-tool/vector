@@ -2,12 +2,14 @@ use std::{ops::Range, sync::Arc};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use collections::BTreeMap;
 use derive_more::{Deref, DerefMut};
 use gpui::{App, Global, SharedString};
 use http_client::HttpClient;
+use itertools::Itertools;
 use parking_lot::RwLock;
 use url::Url;
+
+use crate::repository::RepoPath;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct PullRequest {
@@ -18,8 +20,8 @@ pub struct PullRequest {
 #[derive(Clone)]
 pub struct GitRemote {
     pub host: Arc<dyn GitHostingProvider + Send + Sync + 'static>,
-    pub owner: String,
-    pub repo: String,
+    pub owner: SharedString,
+    pub repo: SharedString,
 }
 
 impl std::fmt::Debug for GitRemote {
@@ -56,8 +58,19 @@ pub struct BuildCommitPermalinkParams<'a> {
 
 pub struct BuildPermalinkParams<'a> {
     pub sha: &'a str,
-    pub path: &'a str,
+    /// URL-escaped path using unescaped `/` as the directory separator.
+    pub path: String,
     pub selection: Option<Range<u32>>,
+}
+
+impl<'a> BuildPermalinkParams<'a> {
+    pub fn new(sha: &'a str, path: &RepoPath, selection: Option<Range<u32>>) -> Self {
+        Self {
+            sha,
+            path: path.components().map(urlencoding::encode).join("/"),
+            selection,
+        }
+    }
 }
 
 /// A Git hosting provider.
@@ -130,7 +143,8 @@ impl Global for GlobalGitHostingProviderRegistry {}
 
 #[derive(Default)]
 struct GitHostingProviderRegistryState {
-    providers: BTreeMap<String, Arc<dyn GitHostingProvider + Send + Sync + 'static>>,
+    default_providers: Vec<Arc<dyn GitHostingProvider + Send + Sync + 'static>>,
+    setting_providers: Vec<Arc<dyn GitHostingProvider + Send + Sync + 'static>>,
 }
 
 #[derive(Default)]
@@ -140,6 +154,7 @@ pub struct GitHostingProviderRegistry {
 
 impl GitHostingProviderRegistry {
     /// Returns the global [`GitHostingProviderRegistry`].
+    #[track_caller]
     pub fn global(cx: &App) -> Arc<Self> {
         cx.global::<GlobalGitHostingProviderRegistry>().0.clone()
     }
@@ -168,7 +183,8 @@ impl GitHostingProviderRegistry {
     pub fn new() -> Self {
         Self {
             state: RwLock::new(GitHostingProviderRegistryState {
-                providers: BTreeMap::default(),
+                setting_providers: Vec::default(),
+                default_providers: Vec::default(),
             }),
         }
     }
@@ -177,7 +193,22 @@ impl GitHostingProviderRegistry {
     pub fn list_hosting_providers(
         &self,
     ) -> Vec<Arc<dyn GitHostingProvider + Send + Sync + 'static>> {
-        self.state.read().providers.values().cloned().collect()
+        let state = self.state.read();
+        state
+            .default_providers
+            .iter()
+            .cloned()
+            .chain(state.setting_providers.iter().cloned())
+            .collect()
+    }
+
+    pub fn set_setting_providers(
+        &self,
+        providers: impl IntoIterator<Item = Arc<dyn GitHostingProvider + Send + Sync + 'static>>,
+    ) {
+        let mut state = self.state.write();
+        state.setting_providers.clear();
+        state.setting_providers.extend(providers);
     }
 
     /// Adds the provided [`GitHostingProvider`] to the registry.
@@ -185,10 +216,7 @@ impl GitHostingProviderRegistry {
         &self,
         provider: Arc<dyn GitHostingProvider + Send + Sync + 'static>,
     ) {
-        self.state
-            .write()
-            .providers
-            .insert(provider.name(), provider);
+        self.state.write().default_providers.push(provider);
     }
 }
 

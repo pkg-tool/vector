@@ -40,7 +40,7 @@ impl GitOnboardingModal {
     }
 
     fn view_blog(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        cx.open_url("https://github.com/pkg-tool/vector/blob/master/docs/git.md");
+        cx.open_url("https://vector.dev/docs/git");
         cx.notify();
 
         git_onboarding_event!("Blog Link Clicked");
@@ -83,8 +83,8 @@ impl Render for GitOnboardingModal {
                 git_onboarding_event!("Cancelled", trigger = "Action");
                 cx.emit(DismissEvent);
             }))
-            .on_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, _cx| {
-                this.focus_handle.focus(window);
+            .on_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                this.focus_handle.focus(window, cx);
             }))
             .child(
                 div().p_1p5().absolute().inset_0().h(px(160.)).child(
@@ -108,7 +108,7 @@ impl Render for GitOnboardingModal {
                     .child(Headline::new("Native Git Support").size(HeadlineSize::Large)),
             )
             .child(h_flex().absolute().top_2().right_2().child(
-                IconButton::new("cancel", IconName::X).on_click(cx.listener(
+                IconButton::new("cancel", IconName::Close).on_click(cx.listener(
                     |_, _: &ClickEvent, _window, cx| {
                         git_onboarding_event!("Cancelled", trigger = "X click");
                         cx.emit(DismissEvent);

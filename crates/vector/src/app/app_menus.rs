@@ -1,41 +1,106 @@
-use gpui::{Menu, MenuItem, OsAction};
+use gpui::{App, Menu, MenuItem, OsAction};
+use release_channel::ReleaseChannel;
 use terminal_view::terminal_panel;
+use vector_actions::ToggleFocus as ToggleDebugPanel;
+use vector_actions::dev;
 
-pub fn app_menus() -> Vec<Menu> {
+pub fn app_menus(cx: &mut App) -> Vec<Menu> {
     use vector_actions::Quit;
+
+    let mut view_items = vec![
+        MenuItem::action(
+            "Zoom In",
+            vector_actions::IncreaseBufferFontSize { persist: false },
+        ),
+        MenuItem::action(
+            "Zoom Out",
+            vector_actions::DecreaseBufferFontSize { persist: false },
+        ),
+        MenuItem::action(
+            "Reset Zoom",
+            vector_actions::ResetBufferFontSize { persist: false },
+        ),
+        MenuItem::action(
+            "Reset All Zoom",
+            vector_actions::ResetAllZoom { persist: false },
+        ),
+        MenuItem::separator(),
+        MenuItem::action("Toggle Left Dock", workspace::ToggleLeftDock),
+        MenuItem::action("Toggle Right Dock", workspace::ToggleRightDock),
+        MenuItem::action("Toggle Bottom Dock", workspace::ToggleBottomDock),
+        MenuItem::action("Toggle All Docks", workspace::ToggleAllDocks),
+        MenuItem::submenu(Menu {
+            name: "Editor Layout".into(),
+            items: vec![
+                MenuItem::action("Split Up", workspace::SplitUp::default()),
+                MenuItem::action("Split Down", workspace::SplitDown::default()),
+                MenuItem::action("Split Left", workspace::SplitLeft::default()),
+                MenuItem::action("Split Right", workspace::SplitRight::default()),
+            ],
+        }),
+        MenuItem::separator(),
+        MenuItem::action("Project Panel", vector_actions::project_panel::ToggleFocus),
+        MenuItem::action("Outline Panel", outline_panel::ToggleFocus),
+        MenuItem::action("Terminal Panel", terminal_panel::ToggleFocus),
+        MenuItem::action("Debugger Panel", ToggleDebugPanel),
+        MenuItem::separator(),
+        MenuItem::action("Diagnostics", diagnostics::Deploy),
+        MenuItem::separator(),
+    ];
+
+    if ReleaseChannel::try_global(cx) == Some(ReleaseChannel::Dev) {
+        view_items.push(MenuItem::action(
+            "Toggle GPUI Inspector",
+            dev::ToggleInspector,
+        ));
+        view_items.push(MenuItem::separator());
+    }
 
     vec![
         Menu {
             name: "Vector".into(),
             items: vec![
-                MenuItem::action("About Vector…", vector_actions::About),
-                MenuItem::action("Check for Updates", auto_update::Check),
+                MenuItem::action("About Vector", vector_actions::About),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu {
                     name: "Settings".into(),
                     items: vec![
-                        MenuItem::action("Open Settings", super::OpenSettings),
-                        MenuItem::action("Open Key Bindings", vector_actions::OpenKeymap),
+                        MenuItem::action("Open Settings", vector_actions::OpenSettings),
+                        MenuItem::action("Open Settings File", super::OpenSettingsFile),
+                        MenuItem::action(
+                            "Open Project Settings",
+                            vector_actions::OpenProjectSettings,
+                        ),
+                        MenuItem::action(
+                            "Open Project Settings File",
+                            super::OpenProjectSettingsFile,
+                        ),
                         MenuItem::action("Open Default Settings", super::OpenDefaultSettings),
+                        MenuItem::separator(),
+                        MenuItem::action("Open Keymap", vector_actions::OpenKeymap),
+                        MenuItem::action("Open Keymap File", vector_actions::OpenKeymapFile),
                         MenuItem::action(
                             "Open Default Key Bindings",
                             vector_actions::OpenDefaultKeymap,
                         ),
-                        MenuItem::action("Open Project Settings", super::OpenProjectSettings),
+                        MenuItem::separator(),
                         MenuItem::action(
                             "Select Theme...",
                             vector_actions::theme_selector::Toggle::default(),
                         ),
+                        MenuItem::action(
+                            "Select Icon Theme...",
+                            vector_actions::icon_theme_selector::Toggle::default(),
+                        ),
                     ],
                 }),
                 MenuItem::separator(),
-                MenuItem::submenu(Menu {
-                    name: "Services".into(),
-                    items: vec![],
-                }),
+                #[cfg(target_os = "macos")]
+                MenuItem::os_submenu("Services", gpui::SystemMenuType::Services),
                 MenuItem::separator(),
                 MenuItem::action("Extensions", vector_actions::Extensions::default()),
-                MenuItem::action("Install CLI", install_cli::Install),
+                #[cfg(not(target_os = "windows"))]
+                MenuItem::action("Install CLI", install_cli::InstallCliBinary),
                 MenuItem::separator(),
                 #[cfg(target_os = "macos")]
                 MenuItem::action("Hide Vector", super::Hide),
@@ -66,13 +131,7 @@ pub fn app_menus() -> Vec<Menu> {
                 MenuItem::action(
                     "Open Recent...",
                     vector_actions::OpenRecent {
-                        create_new_window: true,
-                    },
-                ),
-                MenuItem::action(
-                    "Open Remote...",
-                    vector_actions::OpenRemote {
-                        from_existing_connection: false,
+                        create_new_window: false,
                     },
                 ),
                 MenuItem::separator(),
@@ -104,7 +163,7 @@ pub fn app_menus() -> Vec<Menu> {
                 MenuItem::os_action("Paste", editor::actions::Paste, OsAction::Paste),
                 MenuItem::separator(),
                 MenuItem::action("Find", search::buffer_search::Deploy::find()),
-                MenuItem::action("Find In Project", workspace::DeploySearch::find()),
+                MenuItem::action("Find in Project", workspace::DeploySearch::find()),
                 MenuItem::separator(),
                 MenuItem::action(
                     "Toggle Line Comment",
@@ -122,15 +181,37 @@ pub fn app_menus() -> Vec<Menu> {
                 ),
                 MenuItem::action("Expand Selection", editor::actions::SelectLargerSyntaxNode),
                 MenuItem::action("Shrink Selection", editor::actions::SelectSmallerSyntaxNode),
+                MenuItem::action("Select Next Sibling", editor::actions::SelectNextSyntaxNode),
+                MenuItem::action(
+                    "Select Previous Sibling",
+                    editor::actions::SelectPreviousSyntaxNode,
+                ),
                 MenuItem::separator(),
-                MenuItem::action("Add Cursor Above", editor::actions::AddSelectionAbove),
-                MenuItem::action("Add Cursor Below", editor::actions::AddSelectionBelow),
+                MenuItem::action(
+                    "Add Cursor Above",
+                    editor::actions::AddSelectionAbove {
+                        skip_soft_wrap: true,
+                    },
+                ),
+                MenuItem::action(
+                    "Add Cursor Below",
+                    editor::actions::AddSelectionBelow {
+                        skip_soft_wrap: true,
+                    },
+                ),
                 MenuItem::action(
                     "Select Next Occurrence",
                     editor::actions::SelectNext {
                         replace_newest: false,
                     },
                 ),
+                MenuItem::action(
+                    "Select Previous Occurrence",
+                    editor::actions::SelectPrevious {
+                        replace_newest: false,
+                    },
+                ),
+                MenuItem::action("Select All Occurrences", editor::actions::SelectAllMatches),
                 MenuItem::separator(),
                 MenuItem::action("Move Line Up", editor::actions::MoveLineUp),
                 MenuItem::action("Move Line Down", editor::actions::MoveLineDown),
@@ -139,41 +220,7 @@ pub fn app_menus() -> Vec<Menu> {
         },
         Menu {
             name: "View".into(),
-            items: vec![
-                MenuItem::action(
-                    "Zoom In",
-                    vector_actions::IncreaseBufferFontSize { persist: true },
-                ),
-                MenuItem::action(
-                    "Zoom Out",
-                    vector_actions::DecreaseBufferFontSize { persist: true },
-                ),
-                MenuItem::action(
-                    "Reset Zoom",
-                    vector_actions::ResetBufferFontSize { persist: true },
-                ),
-                MenuItem::separator(),
-                MenuItem::action("Toggle Left Dock", workspace::ToggleLeftDock),
-                MenuItem::action("Toggle Right Dock", workspace::ToggleRightDock),
-                MenuItem::action("Toggle Bottom Dock", workspace::ToggleBottomDock),
-                MenuItem::action("Close All Docks", workspace::CloseAllDocks),
-                MenuItem::submenu(Menu {
-                    name: "Editor Layout".into(),
-                    items: vec![
-                        MenuItem::action("Split Up", workspace::SplitUp),
-                        MenuItem::action("Split Down", workspace::SplitDown),
-                        MenuItem::action("Split Left", workspace::SplitLeft),
-                        MenuItem::action("Split Right", workspace::SplitRight),
-                    ],
-                }),
-                MenuItem::separator(),
-                MenuItem::action("Project Panel", project_panel::ToggleFocus),
-                MenuItem::action("Outline Panel", outline_panel::ToggleFocus),
-                MenuItem::action("Terminal Panel", terminal_panel::ToggleFocus),
-                MenuItem::separator(),
-                MenuItem::action("Diagnostics", diagnostics::Deploy),
-                MenuItem::separator(),
-            ],
+            items: view_items,
         },
         Menu {
             name: "Go".into(),
@@ -194,10 +241,40 @@ pub fn app_menus() -> Vec<Menu> {
                 MenuItem::action("Go to Definition", editor::actions::GoToDefinition),
                 MenuItem::action("Go to Declaration", editor::actions::GoToDeclaration),
                 MenuItem::action("Go to Type Definition", editor::actions::GoToTypeDefinition),
-                MenuItem::action("Find All References", editor::actions::FindAllReferences),
+                MenuItem::action(
+                    "Find All References",
+                    editor::actions::FindAllReferences::default(),
+                ),
                 MenuItem::separator(),
-                MenuItem::action("Next Problem", editor::actions::GoToDiagnostic),
-                MenuItem::action("Previous Problem", editor::actions::GoToPreviousDiagnostic),
+                MenuItem::action("Next Problem", editor::actions::GoToDiagnostic::default()),
+                MenuItem::action(
+                    "Previous Problem",
+                    editor::actions::GoToPreviousDiagnostic::default(),
+                ),
+            ],
+        },
+        Menu {
+            name: "Run".into(),
+            items: vec![
+                MenuItem::action(
+                    "Spawn Task",
+                    vector_actions::Spawn::ViaModal {
+                        reveal_target: None,
+                    },
+                ),
+                MenuItem::action("Start Debugger", debugger_ui::Start),
+                MenuItem::separator(),
+                MenuItem::action("Edit tasks.json...", super::OpenProjectTasks),
+                MenuItem::action("Edit debug.json...", vector_actions::OpenProjectDebugTasks),
+                MenuItem::separator(),
+                MenuItem::action("Continue", debugger_ui::Continue),
+                MenuItem::action("Step Over", debugger_ui::StepOver),
+                MenuItem::action("Step Into", debugger_ui::StepInto),
+                MenuItem::action("Step Out", debugger_ui::StepOut),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Breakpoint", editor::actions::ToggleBreakpoint),
+                MenuItem::action("Edit Breakpoint", editor::actions::EditLogBreakpoint),
+                MenuItem::action("Clear All Breakpoints", debugger_ui::ClearAllBreakpoints),
             ],
         },
         Menu {
@@ -211,19 +288,8 @@ pub fn app_menus() -> Vec<Menu> {
         Menu {
             name: "Help".into(),
             items: vec![
-                MenuItem::action(
-                    "View Release Notes",
-                    auto_update_ui::ViewReleaseNotesLocally,
-                ),
                 MenuItem::action("View Dependency Licenses", vector_actions::OpenLicenses),
-                MenuItem::action("Show Welcome", workspace::Welcome),
-                MenuItem::separator(),
-                MenuItem::action(
-                    "Documentation",
-                    super::OpenBrowser {
-                        url: "https://vector.dev/docs".into(),
-                    },
-                ),
+                MenuItem::action("Show Welcome", onboarding::ShowWelcome),
             ],
         },
     ]

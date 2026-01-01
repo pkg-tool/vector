@@ -11,7 +11,7 @@ C# support is available through the [C# extension](https://github.com/vector-ext
 
 The `OmniSharp` binary can be configured in a Vector settings file with:
 
-```json
+```json [settings]
 {
   "lsp": {
     "omnisharp": {

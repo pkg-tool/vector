@@ -16,7 +16,7 @@ If you use files with the `*.jsonc` extension when using `Format Document` or ha
 
 To workaround this behavior you can add the following to your `.prettierrc` configuration file:
 
-```json
+```json [settings]
 {
   "overrides": [
     {
@@ -32,7 +32,7 @@ To workaround this behavior you can add the following to your `.prettierrc` conf
 
 ## JSON Language Server
 
-Vector automatically out of the box supports JSON Schema validation of `package.json` and `tsconfig.json` files, but `json-language-server` can use JSON Schema definitions in project files, from the [JSON Schema Store](https://www.schemastore.org/json/) or other publicly available URLs for JSON validation.
+Zed automatically out of the box supports JSON Schema validation of `package.json` and `tsconfig.json` files, but `json-language-server` can use JSON Schema definitions in project files, from the [JSON Schema Store](https://www.schemastore.org) or other publicly available URLs for JSON validation.
 
 ### Inline Schema Specification
 
@@ -40,7 +40,7 @@ To specify a schema inline with your JSON files, add a `$schema` top level key l
 
 For example to for a `.luarc.json` for use with [lua-language-server](https://github.com/LuaLS/lua-language-server/):
 
-```json
+```json [settings]
 {
   "$schema": "https://raw.githubusercontent.com/sumneko/vscode-lua/master/setting/schema.json",
   "runtime.version": "Lua 5.4"
@@ -53,7 +53,7 @@ You can alternatively associate JSON Schemas with file paths by via Vector LSP s
 
 To
 
-```json
+```json [settings]
 "lsp": {
   "json-language-server": {
     "settings": {

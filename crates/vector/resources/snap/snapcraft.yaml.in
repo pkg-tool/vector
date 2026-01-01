@@ -51,6 +51,8 @@ parts:
       - -usr/share/man
 
 apps:
-  vector:
-    command: usr/bin/vector
-    common-id: dev.vector.Vector
+  zed:
+    command: usr/bin/zed
+    common-id: dev.zed.Zed
+    environment:
+      ZED_BUNDLE_TYPE: snap

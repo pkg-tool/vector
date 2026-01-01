@@ -18,7 +18,7 @@ Clone the Vector repository.
 
 If you can't compile Vector, make sure that you have at least the following components installed in case of a Visual Studio installation:
 
-```json
+```json [settings]
 {
   "version": "1.0",
   "components": [
@@ -36,7 +36,7 @@ If you can't compile Vector, make sure that you have at least the following comp
 
 Or if in case of just Build Tools, the following components:
 
-```json
+```json [settings]
 {
   "version": "1.0",
   "components": [
@@ -66,9 +66,25 @@ The list can be obtained as follows:
 - Click on `More` in the `Installed` tab
 - Click on `Export configuration`
 
-## Backend dependencies
+### Notes
 
-Vector does not include collaboration or call features in this fork, so there are no additional backend services required for development.
+You should modify the `pg_hba.conf` file in the `data` directory to use `trust` instead of `scram-sha-256` for the `host` method. Otherwise, the connection will fail with the error `password authentication failed`. The `pg_hba.conf` file typically locates at `C:\Program Files\PostgreSQL\17\data\pg_hba.conf`. After the modification, the file should look like this:
+
+```conf
+# IPv4 local connections:
+host    all             all             127.0.0.1/32            trust
+# IPv6 local connections:
+host    all             all             ::1/128                 trust
+```
+
+Also, if you are using a non-latin Windows version, you must modify the`lc_messages` parameter in the `postgresql.conf` file in the `data` directory to `English_United States.1252` (or whatever UTF8-compatible encoding you have). Otherwise, the database will panic. The `postgresql.conf` file should look like this:
+
+```conf
+# lc_messages = 'Chinese (Simplified)_China.936' # locale for system error message strings
+lc_messages = 'English_United States.1252'
+```
+
+After this, you should restart the `postgresql` service. Press the `win` key + `R` to launch the `Run` window. Type the `services.msc` and hit the `OK` button to open the Services Manager. Then, find the `postgresql-x64-XX` service, right-click on it, and select `Restart`.
 
 ## Building from source
 
@@ -94,18 +110,9 @@ cargo test --workspace
 
 ## Installing from msys2
 
-[MSYS2](https://msys2.org/) distribution provides Vector as a package `mingw-w64-vector`. The package is available for UCRT64, MINGW64 and CLANG64 repositories. To download it, run
+Zed does not support unofficial MSYS2 Zed packages built for Mingw-w64. Please report any issues you may have with [mingw-w64-zed](https://packages.msys2.org/base/mingw-w64-zed) to [msys2/MINGW-packages/issues](https://github.com/msys2/MINGW-packages/issues?q=is%3Aissue+is%3Aopen+zed).
 
-```sh
-pacman -Syu
-pacman -S $MINGW_PACKAGE_PREFIX-vector
-```
-
-then you can run the `vector` CLI. Editor executable is installed under `$MINGW_PREFIX/lib/vector` directory
-
-You can see the build script for more details on the build process.
-
-> Please, report any issue in [msys2/MINGW-packages/issues](https://github.com/msys2/MINGW-packages/issues) first.
+Please refer to [MSYS2 documentation](https://www.msys2.org/docs/ides-editors/#zed) first.
 
 ## Troubleshooting
 
@@ -226,3 +233,23 @@ New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name
 For more information on this, please see [win32 docs](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation?tabs=powershell)
 
 (note that you will need to restart your system after enabling longpath support)
+
+### Graphics issues
+
+#### Zed fails to launch
+
+Currently, Zed uses Vulkan as its graphics API on Windows. However, Vulkan isn't always the most reliable on Windows, so if Zed fails to launch, it's likely a Vulkan-related issue.
+
+You can check the Zed log at:
+`C:\Users\YOU\AppData\Local\Zed\logs\Zed.log`
+
+If you see messages like:
+
+- `Zed failed to open a window: NoSupportedDeviceFound`
+- `ERROR_INITIALIZATION_FAILED`
+- `GPU Crashed`
+- `ERROR_SURFACE_LOST_KHR`
+
+Then Vulkan might not be working properly on your system. In most cases, updating your GPU drivers may help resolve this.
+
+If there's nothing Vulkan-related in the logs and you happen to have Bandicam installed, try uninstalling it. Zed is currently not compatible with Bandicam.

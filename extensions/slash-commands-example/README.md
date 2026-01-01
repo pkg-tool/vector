@@ -76,8 +76,7 @@ Rebuild to see these changes reflected:
 
 ## Troubleshooting / Logs
 
-- Linux: `tail -f ~/.local/share/vector/logs/Vector.log`
-- macOS: `tail -f ~/Library/Logs/Vector/Vector.log`
+- [zed.dev docs: Troubleshooting](https://zed.dev/docs/troubleshooting)
 
 ## Documentation
 

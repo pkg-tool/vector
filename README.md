@@ -1,18 +1,25 @@
 # Vector
 
-Vector is a high-performance code editor.
+[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
+[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+
+Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
 
 ---
 
 ### Installation
 
-See `docs/src/development.md` for build instructions.
+On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
 
 ### Developing Vector
 
-- [Building Vector for macOS](./docs/src/development/macos.md)
-- [Building Vector for Linux](./docs/src/development/linux.md)
-- [Building Vector for Windows](./docs/src/development/windows.md)
+- Web ([tracking issue](https://github.com/zed-industries/zed/issues/5396))
+
+### Developing Zed
+
+- [Building Zed for macOS](./docs/src/development/macos.md)
+- [Building Zed for Linux](./docs/src/development/linux.md)
+- [Building Zed for Windows](./docs/src/development/windows.md)
 
 ### Contributing
 

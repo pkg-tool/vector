@@ -39,7 +39,7 @@ If you missed this, you can toggle vim mode on or off anytime by opening the com
 
 > **Note**: This command toggles the following property in your user settings:
 >
-> ```json
+> ```json [settings]
 > {
 >   "vim_mode": true
 > }
@@ -47,7 +47,7 @@ If you missed this, you can toggle vim mode on or off anytime by opening the com
 
 ## Vector-specific features
 
-Vector is built on a modern foundation that (among other things) uses tree-sitter and language servers to understand the content of the file you're editing and supports multiple cursors out of the box.
+Zed is built on a modern foundation that (among other things) uses Tree-sitter and language servers to understand the content of the file you're editing and supports multiple cursors out of the box.
 
 Vim mode has several "core Vector" key bindings that will help you make the most of Vector's specific feature set.
 
@@ -82,9 +82,9 @@ The following commands use the language server to help you navigate and refactor
 | Unstage and next (in diff view) | `d U`            |
 | Restore change                  | `d p`            |
 
-### Treesitter
+### Tree-sitter
 
-Treesitter is a powerful tool that Vector uses to understand the structure of your code. Vector provides motions that change the current cursor position, and text objects that can be used as the target of actions.
+Tree-sitter is a powerful tool that Zed uses to understand the structure of your code. Zed provides motions that change the current cursor position, and text objects that can be used as the target of actions.
 
 | Command                         | Default Shortcut            |
 | ------------------------------- | --------------------------- |
@@ -117,7 +117,7 @@ if there are no classes, then functions are also used. Similarly `gc` is used to
 
 The definition of functions, classes and comments is language dependent, and support can be added
 to extensions by adding a [`textobjects.scm`]. The definition of arguments and tags operates at
-the tree-sitter level, but looks for certain patterns in the parse tree and is not currently configurable
+the Tree-sitter level, but looks for certain patterns in the parse tree and is not currently configurable
 per language.
 
 ### Multi cursor
@@ -219,7 +219,7 @@ These text objects implement the behavior of the [mini.ai](https://github.com/ec
 
 To use these text objects, you need to add bindings to your keymap. Here's an example configuration that makes them available when using text object operators (`i` and `a`) or change-surrounds (`cs`):
 
-```json
+```json [settings]
 {
   "context": "vim_operator == a || vim_operator == i || vim_operator == cs",
   "bindings": {
@@ -237,9 +237,9 @@ To use these text objects, you need to add bindings to your keymap. Here's an ex
 With this configuration, you can use commands like:
 
 - `cib` - Change inside brackets using AnyBrackets behavior
-- `cim` - Change inside brackets using MiniBrackets behavior
+- `ciB` - Change inside brackets using MiniBrackets behavior
 - `ciq` - Change inside quotes using AnyQuotes behavior
-- `ciM` - Change inside quotes using MiniQuotes behavior
+- `ciQ` - Change inside quotes using MiniQuotes behavior
 
 ## Command palette
 
@@ -286,6 +286,7 @@ These ex commands open Vector's various panels and windows.
 | Open the project panel       | `:E[xplore]`     |
 | Open the AI panel            | `:A[I]`          |
 | Open the git panel           | `:G[it]`         |
+| Open the debug panel         | `:D[ebug]`       |
 | Open the notifications panel | `:No[tif]`       |
 | Open the feedback window     | `:fe[edback]`    |
 | Open the diagnostics window  | `:cl[ist]`       |
@@ -349,6 +350,7 @@ These commands modify editor options locally for the current buffer.
 | `:se[t] [no]wrap`               | Lines longer than the width of the window will wrap and displaying continues on the next line |
 | `:se[t] [no]nu[mber]`           | Print the line number in front of each line                                                   |
 | `:se[t] [no]r[elative]nu[mber]` | Changes the displayed number to be relative to the cursor                                     |
+| `:se[t] [no]i[gnore]c[ase]`     | Controls whether the buffer and project search use case-sensitive matching                    |
 
 ### Command mnemonics
 
@@ -373,7 +375,7 @@ In this section, we'll learn how to customize the key bindings of Vector's vim m
 
 Vector's key bindings are evaluated only when the `"context"` property matches your location in the editor. For example, if you add key bindings to the `"Editor"` context, they will only work when you're editing a file. If you add key bindings to the `"Workspace"` context, they will work everywhere in Vector. Here's an example of a key binding that saves when you're editing a file:
 
-```json
+```json [settings]
 {
   "context": "Editor",
   "bindings": {
@@ -384,12 +386,12 @@ Vector's key bindings are evaluated only when the `"context"` property matches y
 
 Contexts are nested, so when you're editing a file, the context is the `"Editor"` context, which is inside the `"Pane"` context, which is inside the `"Workspace"` context. That's why any key bindings you add to the `"Workspace"` context will work when you're editing a file. Here's an example:
 
-```json
-// This key binding will work when you're editing a file. It comes built into Vector by default as the workspace: save command.
+```json [keymap]
+// This key binding will work when you're editing a file. It comes built into Zed by default as the workspace: save command.
 {
   "context": "Workspace",
   "bindings": {
-    "ctrl-s": "file::Save"
+    "ctrl-s": "workspace::Save"
   }
 }
 ```
@@ -415,7 +417,7 @@ Vim mode adds several contexts to the `"Editor"` context:
 
 Here's a template with useful vim mode contexts to help you customize your vim mode key bindings. You can copy it and integrate it into your user keymap.
 
-```json
+```json [keymap]
 [
   {
     "context": "VimControl && !menu",
@@ -454,7 +456,7 @@ By default, you can navigate between the different files open in the editor with
 
 But you cannot use the same shortcuts to move between all the editor docks (the terminal, project panel, assistant panel, ...). If you want to use the same shortcuts to navigate to the docks, you can add the following key bindings to your user keymap.
 
-```json
+```json [settings]
 {
   "context": "Dock",
   "bindings": {
@@ -467,9 +469,9 @@ But you cannot use the same shortcuts to move between all the editor docks (the 
 }
 ```
 
-Subword motion, which allows you to navigate and select individual words in camelCase or snake_case, is not enabled by default. To enable it, add these bindings to your keymap.
+Subword motion, which allows you to navigate and select individual words in `camelCase` or `snake_case`, is not enabled by default. To enable it, add these bindings to your keymap.
 
-```json
+```json [settings]
 {
   "context": "VimControl && !menu && vim_mode != operator",
   "bindings": {
@@ -481,20 +483,23 @@ Subword motion, which allows you to navigate and select individual words in came
 }
 ```
 
+> Note: Operations like `dw` remain unaffected. If you would like operations to
+> also use subword motion, remove `vim_mode != operator` from the `context`.
+
 Vim mode comes with shortcuts to surround the selection in normal mode (`ys`), but it doesn't have a shortcut to add surrounds in visual mode. By default, `shift-s` substitutes the selection (erases the text and enters insert mode). To use `shift-s` to add surrounds in visual mode, you can add the following object to your keymap.
 
-```json
+```json [settings]
 {
   "context": "vim_mode == visual",
   "bindings": {
-    "shift-s": ["vim::PushAddSurrounds", {}]
+    "shift-s": "vim::PushAddSurrounds"
   }
 }
 ```
 
 In non-modal text editors, cursor navigation typically wraps when moving past line ends. Vector, however, handles this behavior exactly like Vim by default: the cursor stops at line boundaries. If you prefer your cursor to wrap between lines, override these keybindings:
 
-```json
+```json [settings]
 // In VimScript, this would look like this:
 // set whichwrap+=<,>,[,],h,l
 {
@@ -510,7 +515,7 @@ In non-modal text editors, cursor navigation typically wraps when moving past li
 
 The [Sneak motion](https://github.com/justinmk/vim-sneak) feature allows for quick navigation to any two-character sequence in your text. You can enable it by adding the following keybindings to your keymap. By default, the `s` key is mapped to `vim::Substitute`. Adding these bindings will override that behavior, so ensure this change aligns with your workflow preferences.
 
-```json
+```json [settings]
 {
   "context": "vim_mode == normal || vim_mode == visual",
   "bindings": {
@@ -522,7 +527,7 @@ The [Sneak motion](https://github.com/justinmk/vim-sneak) feature allows for qui
 
 The [vim-exchange](https://github.com/tommcdo/vim-exchange) feature does not have a default binding for visual mode, as the `shift-x` binding conflicts with the default `shift-x` binding for visual mode (`vim::VisualDeleteLine`). To assign the default vim-exchange binding, add the following keybinding to your keymap:
 
-```json
+```json [settings]
 {
   "context": "vim_mode == visual",
   "bindings": {
@@ -531,22 +536,23 @@ The [vim-exchange](https://github.com/tommcdo/vim-exchange) feature does not hav
 }
 ```
 
-### Restoring common text editing keybindings
+### Restoring common text editing and Zed keybindings
 
 If you're using vim mode on Linux or Windows, you may find it overrides keybindings you can't live without: `ctrl+v` to paste, `ctrl+f` to search, etc. You can restore them by copying this data into your keymap:
 
-```json
+```json [keymap]
 {
   "context": "Editor && !menu",
   "bindings": {
-    "ctrl-c": "editor::Copy",          // vim default: return to normal mode
-    "ctrl-x": "editor::Cut",           // vim default: decrement
-    "ctrl-v": "editor::Paste",         // vim default: visual block mode
-    "ctrl-y": "editor::Undo",          // vim default: line up
-    "ctrl-f": "buffer_search::Deploy", // vim default: page down
-    "ctrl-o": "workspace::Open",       // vim default: go back
-    "ctrl-s": "workspace::Save",       // vim default: show signature
-    "ctrl-a": "editor::SelectAll",     // vim default: increment
+    "ctrl-c": "editor::Copy",               // vim default: return to normal mode
+    "ctrl-x": "editor::Cut",                // vim default: decrement
+    "ctrl-v": "editor::Paste",              // vim default: visual block mode
+    "ctrl-y": "editor::Undo",               // vim default: line up
+    "ctrl-f": "buffer_search::Deploy",      // vim default: page down
+    "ctrl-o": "workspace::Open",            // vim default: go back
+    "ctrl-s": "workspace::Save",            // vim default: show signature
+    "ctrl-a": "editor::SelectAll",          // vim default: increment
+    "ctrl-b": "workspace::ToggleLeftDock"   // vim default: down
   }
 },
 ```
@@ -559,15 +565,16 @@ You can change the following settings to modify vim mode's behavior:
 | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
 | default_mode                 | The default mode to start in. One of "normal", "insert", "replace", "visual", "visual_line", "visual_block", "helix_normal".                                                                  | "normal"      |
 | use_system_clipboard         | Determines how system clipboard is used:<br><ul><li>"always": use for all operations</li><li>"never": only use when explicitly specified</li><li>"on_yank": use for yank operations</li></ul> | "always"      |
-| use_multiline_find           | If `true`, `f` and `t` motions extend across multiple lines.                                                                                                                                  | false         |
+| use_multiline_find           | deprecated                                                                                                                                                                                    |
 | use_smartcase_find           | If `true`, `f` and `t` motions are case-insensitive when the target letter is lowercase.                                                                                                      | false         |
-| toggle_relative_line_numbers | If `true`, line numbers are relative in normal mode and absolute in insert mode, giving you the best of both options.                                                                         | false         |
+| toggle_relative_line_numbers | deprecated                                                                                                                                                                                    | false         |
+| relative_line_numbers        | If "enabled", line numbers are relative in normal mode and absolute in insert mode, giving you the best of both options.                                                                      | "disabled"    |
 | custom_digraphs              | An object that allows you to add custom digraphs. Read below for an example.                                                                                                                  | {}            |
 | highlight_on_yank_duration   | The duration of the highlight animation(in ms). Set to `0` to disable                                                                                                                         | 200           |
 
 Here's an example of adding a digraph for the zombie emoji. This allows you to type `ctrl-k f z` to insert a zombie emoji. You can add as many digraphs as you like.
 
-```json
+```json [settings]
 {
   "vim": {
     "custom_digraphs": {
@@ -579,14 +586,13 @@ Here's an example of adding a digraph for the zombie emoji. This allows you to t
 
 Here's an example of these settings changed:
 
-```json
+```json [settings]
 {
   "vim": {
     "default_mode": "insert",
     "use_system_clipboard": "never",
-    "use_multiline_find": true,
     "use_smartcase_find": true,
-    "toggle_relative_line_numbers": true,
+    "relative_line_numbers": "enabled",
     "highlight_on_yank_duration": 50,
     "custom_digraphs": {
       "fz": "🧟‍♀️"
@@ -602,7 +608,7 @@ Here are a few general Vector settings that can help you fine-tune your Vim expe
 | Property                | Description                                                                                                                                                   | Default Value        |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
 | cursor_blink            | If `true`, the cursor blinks.                                                                                                                                 | `true`               |
-| relative_line_numbers   | If `true`, line numbers in the left gutter are relative to the cursor.                                                                                        | `false`              |
+| relative_line_numbers   | If `"enabled"`, line numbers in the left gutter are relative to the cursor. If `"wrapped"`, they also display for wrapped lines.                              | `"disabled"`         |
 | scrollbar               | Object that controls the scrollbar display. Set to `{ "show": "never" }` to hide the scroll bar.                                                              | `{ "show": "auto" }` |
 | scroll_beyond_last_line | If set to `"one_page"`, allows scrolling up to one page beyond the last line. Set to `"off"` to prevent this behavior.                                        | `"one_page"`         |
 | vertical_scroll_margin  | The number of lines to keep above or below the cursor when scrolling. Set to `0` to allow the cursor to go up to the edges of the screen vertically.          | `3`                  |
@@ -611,12 +617,12 @@ Here are a few general Vector settings that can help you fine-tune your Vim expe
 
 Here's an example of these settings changed:
 
-```json
+```json [settings]
 {
   // Disable cursor blink
   "cursor_blink": false,
   // Use relative line numbers
-  "relative_line_numbers": true,
+  "relative_line_numbers": "enabled",
   // Hide the scroll bar
   "scrollbar": { "show": "never" },
   // Prevent the buffer from scrolling beyond the last line
@@ -624,7 +630,7 @@ Here's an example of these settings changed:
   // Allow the cursor to reach the edges of the screen
   "vertical_scroll_margin": 0,
   "gutter": {
-    // Disable line numbers completely:
+    // Disable line numbers completely
     "line_numbers": false
   },
   "command_aliases": {

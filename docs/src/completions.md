@@ -9,11 +9,15 @@ Vector supports two sources for completions:
 
 When there is an appropriate language server available, Vector will provide completions of variable names, functions, and other symbols in the current file. You can disable these by adding the following to your Vector `settings.json` file:
 
-```json
+```json [settings]
 "show_completions_on_input": false
 ```
 
 You can manually trigger completions with `ctrl-space` or by triggering the `editor::ShowCompletions` action from the command palette.
+
+> Note: Using `ctrl-space` in Zed requires disabling the macOS global shortcut.
+> Open **System Settings** > **Keyboard** > **Keyboard Shortcut**s >
+> **Input Sources** and uncheck **Select the previous input source**.
 
 For more information, see:
 

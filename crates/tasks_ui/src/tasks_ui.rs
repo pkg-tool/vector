@@ -80,7 +80,14 @@ pub fn init(cx: &mut App) {
                             );
                         }
                     } else {
-                        toggle_modal(workspace, None, window, cx).detach();
+                        spawn_task_or_modal(
+                            workspace,
+                            &Spawn::ViaModal {
+                                reveal_target: None,
+                            },
+                            window,
+                            cx,
+                        );
                     };
                 });
         },
@@ -141,10 +148,9 @@ pub fn toggle_modal(
 ) -> Task<()> {
     let task_store = workspace.project().read(cx).task_store().clone();
     let workspace_handle = workspace.weak_handle();
-    let can_open_modal = workspace.project().update(cx, |project, cx| {
-        let _ = cx;
-        project.is_local()
-    });
+    let can_open_modal = workspace
+        .project()
+        .read_with(cx, |project, _| !project.is_via_collab());
     if can_open_modal {
         let task_contexts = task_contexts(workspace, window, cx);
         cx.spawn_in(window, async move |workspace, cx| {
@@ -186,31 +192,33 @@ where
             task_contexts(workspace, window, cx)
         })?;
         let task_contexts = task_contexts.await;
-        let mut tasks = workspace.update(cx, |workspace, cx| {
-            let Some(task_inventory) = workspace
-                .project()
-                .read(cx)
-                .task_store()
-                .read(cx)
-                .task_inventory()
-                .cloned()
-            else {
-                return Vec::new();
-            };
-            let (file, language) = task_contexts
-                .location()
-                .map(|location| {
-                    let buffer = location.buffer.read(cx);
-                    (
-                        buffer.file().cloned(),
-                        buffer.language_at(location.range.start),
-                    )
-                })
-                .unwrap_or_default();
-            task_inventory
-                .read(cx)
-                .list_tasks(file, language, task_contexts.worktree(), cx)
-        })?;
+        let mut tasks = workspace
+            .update(cx, |workspace, cx| {
+                let Some(task_inventory) = workspace
+                    .project()
+                    .read(cx)
+                    .task_store()
+                    .read(cx)
+                    .task_inventory()
+                    .cloned()
+                else {
+                    return Task::ready(Vec::new());
+                };
+                let (file, language) = task_contexts
+                    .location()
+                    .map(|location| {
+                        let buffer = location.buffer.read(cx);
+                        (
+                            buffer.file().cloned(),
+                            buffer.language_at(location.range.start),
+                        )
+                    })
+                    .unwrap_or_default();
+                task_inventory
+                    .read(cx)
+                    .list_tasks(file, language, task_contexts.worktree(), cx)
+            })?
+            .await;
 
         let did_spawn = workspace
             .update_in(cx, |workspace, window, cx| {
@@ -219,10 +227,10 @@ where
 
                 tasks.retain_mut(|(task_source_kind, target_task)| {
                     if predicate((task_source_kind, target_task)) {
-                        if let Some(overrides) = &overrides {
-                            if let Some(target_override) = overrides.reveal_target {
-                                target_task.reveal_target = target_override;
-                            }
+                        if let Some(overrides) = &overrides
+                            && let Some(target_override) = overrides.reveal_target
+                        {
+                            target_task.reveal_target = target_override;
                         }
                         workspace.schedule_task(
                             task_source_kind.clone(),
@@ -275,12 +283,14 @@ pub fn task_contexts(
                 .project()
                 .read(cx)
                 .worktree_for_id(*worktree_id, cx)
-                .map_or(false, |worktree| is_visible_directory(&worktree, cx))
+                .is_some_and(|worktree| is_visible_directory(&worktree, cx))
         })
-        .or(workspace
-            .visible_worktrees(cx)
-            .next()
-            .map(|tree| tree.read(cx).id()));
+        .or_else(|| {
+            workspace
+                .visible_worktrees(cx)
+                .next()
+                .map(|tree| tree.read(cx).id())
+        });
 
     let active_editor = active_item.and_then(|item| item.act_as::<Editor>(cx));
 
@@ -333,11 +343,10 @@ pub fn task_contexts(
         task_contexts.lsp_task_sources = lsp_task_sources;
         task_contexts.latest_selection = latest_selection;
 
-        if let Some(editor_context_task) = editor_context_task {
-            if let Some(editor_context) = editor_context_task.await {
-                task_contexts.active_item_context =
-                    Some((active_worktree, location, editor_context));
-            }
+        if let Some(editor_context_task) = editor_context_task
+            && let Some(editor_context) = editor_context_task.await
+        {
+            task_contexts.active_item_context = Some((active_worktree, location, editor_context));
         }
 
         if let Some(active_worktree) = active_worktree {
@@ -363,14 +372,14 @@ pub fn task_contexts(
 
 fn is_visible_directory(worktree: &Entity<Worktree>, cx: &App) -> bool {
     let worktree = worktree.read(cx);
-    worktree.is_visible() && worktree.root_entry().map_or(false, |entry| entry.is_dir())
+    worktree.is_visible() && worktree.root_entry().is_some_and(|entry| entry.is_dir())
 }
 
 fn worktree_context(worktree_abs_path: &Path) -> TaskContext {
     let mut task_variables = TaskVariables::default();
     task_variables.insert(
         VariableName::WorktreeRoot,
-        worktree_abs_path.to_string_lossy().to_string(),
+        worktree_abs_path.to_string_lossy().into_owned(),
     );
     TaskContext {
         cwd: Some(worktree_abs_path.to_path_buf()),
@@ -383,14 +392,14 @@ fn worktree_context(worktree_abs_path: &Path) -> TaskContext {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use editor::Editor;
+    use editor::{Editor, MultiBufferOffset, SelectionEffects};
     use gpui::TestAppContext;
     use language::{Language, LanguageConfig};
     use project::{BasicContextProvider, FakeFs, Project};
     use serde_json::json;
     use task::{TaskContext, TaskVariables, VariableName};
     use ui::VisualContext;
-    use util::{path, separator};
+    use util::{path, rel_path::rel_path};
     use workspace::{AppState, Workspace};
 
     use crate::task_contexts;
@@ -425,7 +434,7 @@ mod tests {
         )
         .await;
         let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
-        let worktree_store = project.read_with(cx, |project, _| project.worktree_store().clone());
+        let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
         let rust_language = Arc::new(
             Language::new(
                 LanguageConfig::default(),
@@ -470,8 +479,9 @@ mod tests {
 
         let buffer1 = workspace
             .update(cx, |this, cx| {
-                this.project()
-                    .update(cx, |this, cx| this.open_buffer((worktree_id, "a.ts"), cx))
+                this.project().update(cx, |this, cx| {
+                    this.open_buffer((worktree_id, rel_path("a.ts")), cx)
+                })
             })
             .await
             .unwrap();
@@ -484,7 +494,7 @@ mod tests {
         let buffer2 = workspace
             .update(cx, |this, cx| {
                 this.project().update(cx, |this, cx| {
-                    this.open_buffer((worktree_id, "rust/b.rs"), cx)
+                    this.open_buffer((worktree_id, rel_path("rust/b.rs")), cx)
                 })
             })
             .await
@@ -514,7 +524,7 @@ mod tests {
                 task_variables: TaskVariables::from_iter([
                     (VariableName::File, path!("/dir/rust/b.rs").into()),
                     (VariableName::Filename, "b.rs".into()),
-                    (VariableName::RelativeFile, separator!("rust/b.rs").into()),
+                    (VariableName::RelativeFile, path!("rust/b.rs").into()),
                     (VariableName::RelativeDir, "rust".into()),
                     (VariableName::Dirname, path!("/dir/rust").into()),
                     (VariableName::Stem, "b".into()),
@@ -528,8 +538,8 @@ mod tests {
 
         // And now, let's select an identifier.
         editor2.update_in(cx, |editor, window, cx| {
-            editor.change_selections(None, window, cx, |selections| {
-                selections.select_ranges([14..18])
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([MultiBufferOffset(14)..MultiBufferOffset(18)])
             })
         });
 
@@ -546,7 +556,7 @@ mod tests {
                 task_variables: TaskVariables::from_iter([
                     (VariableName::File, path!("/dir/rust/b.rs").into()),
                     (VariableName::Filename, "b.rs".into()),
-                    (VariableName::RelativeFile, separator!("rust/b.rs").into()),
+                    (VariableName::RelativeFile, path!("rust/b.rs").into()),
                     (VariableName::RelativeDir, "rust".into()),
                     (VariableName::Dirname, path!("/dir/rust").into()),
                     (VariableName::Stem, "b".into()),
@@ -592,11 +602,9 @@ mod tests {
     pub(crate) fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
             let state = AppState::test(cx);
-            language::init(cx);
             crate::init(cx);
             editor::init(cx);
-            workspace::init_settings(cx);
-            Project::init_settings(cx);
+            TaskStore::init(None);
             state
         })
     }

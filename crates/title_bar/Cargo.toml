@@ -25,15 +25,17 @@ test-support = [
 ]
 
 [dependencies]
+anyhow.workspace = true
 auto_update.workspace = true
 chrono.workspace = true
 db.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["screen-capture"] }
 notifications.workspace = true
 project.workspace = true
 schemars.workspace = true
 serde.workspace = true
 settings.workspace = true
+telemetry.workspace = true
 smallvec.workspace = true
 story = { workspace = true, optional = true }
 theme.workspace = true
@@ -41,7 +43,6 @@ ui.workspace = true
 util.workspace = true
 workspace.workspace = true
 vector_actions.workspace = true
-workspace-hack.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

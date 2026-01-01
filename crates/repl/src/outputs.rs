@@ -33,16 +33,11 @@
 //! This module is designed to work with Jupyter message protocols,
 //! interpreting and displaying various types of Jupyter output.
 
-use std::time::Duration;
-
 use editor::{Editor, MultiBuffer};
-use gpui::{
-    Animation, AnimationExt, AnyElement, ClipboardItem, Entity, Render, Transformation, WeakEntity,
-    percentage,
-};
+use gpui::{AnyElement, ClipboardItem, Entity, Render, WeakEntity};
 use language::Buffer;
 use runtimelib::{ExecutionState, JupyterMessageContent, MimeBundle, MimeType};
-use ui::{Context, IntoElement, Styled, Tooltip, Window, div, prelude::*, v_flex};
+use ui::{CommonAnimationExt, CopyButton, IconButton, Tooltip, prelude::*};
 
 mod image;
 use image::ImageView;
@@ -149,13 +144,13 @@ impl Output {
                         IconButton::new(ElementId::Name("copy-output".into()), IconName::Copy)
                             .style(ButtonStyle::Transparent)
                             .tooltip(Tooltip::text("Copy Output"))
-                            .on_click(cx.listener(move |_, _, window, cx| {
+                            .on_click(move |_, window, cx| {
                                 let clipboard_content = v.clipboard_content(window, cx);
 
                                 if let Some(clipboard_content) = clipboard_content.as_ref() {
                                     cx.write_to_clipboard(clipboard_content.clone());
                                 }
-                            })),
+                            }),
                     )
                 })
                 .when(v.has_buffer_content(window, cx), |el| {
@@ -163,14 +158,13 @@ impl Output {
                     el.child(
                         IconButton::new(
                             ElementId::Name("open-in-buffer".into()),
-                            IconName::FileText,
+                            IconName::FileTextOutlined,
                         )
                         .style(ButtonStyle::Transparent)
                         .tooltip(Tooltip::text("Open in Buffer"))
-                        .on_click(cx.listener({
+                        .on_click({
                             let workspace = workspace.clone();
-
-                            move |_, _, window, cx| {
+                            move |_, window, cx| {
                                 let buffer_content =
                                     v.update(cx, |item, cx| item.buffer_content(window, cx));
 
@@ -196,7 +190,7 @@ impl Output {
                                         .ok();
                                 }
                             }
-                        })),
+                        }),
                     )
                 })
                 .into_any_element(),
@@ -221,31 +215,83 @@ impl Output {
         };
 
         h_flex()
+            .id("output-content")
             .w_full()
+            .overflow_x_scroll()
             .items_start()
             .child(div().flex_1().children(content))
             .children(match self {
                 Self::Plain { content, .. } => {
-                    Self::render_output_controls(content.clone(), workspace.clone(), window, cx)
+                    Self::render_output_controls(content.clone(), workspace, window, cx)
                 }
                 Self::Markdown { content, .. } => {
-                    Self::render_output_controls(content.clone(), workspace.clone(), window, cx)
+                    Self::render_output_controls(content.clone(), workspace, window, cx)
                 }
                 Self::Stream { content, .. } => {
-                    Self::render_output_controls(content.clone(), workspace.clone(), window, cx)
+                    Self::render_output_controls(content.clone(), workspace, window, cx)
                 }
                 Self::Image { content, .. } => {
-                    Self::render_output_controls(content.clone(), workspace.clone(), window, cx)
+                    Self::render_output_controls(content.clone(), workspace, window, cx)
                 }
-                Self::ErrorOutput(err) => Self::render_output_controls(
-                    err.traceback.clone(),
-                    workspace.clone(),
-                    window,
-                    cx,
+                Self::ErrorOutput(err) => Some(
+                    h_flex()
+                        .pl_1()
+                        .child({
+                            let ename = err.ename.clone();
+                            let evalue = err.evalue.clone();
+                            let traceback = err.traceback.clone();
+                            let traceback_text = traceback.read(cx).full_text();
+                            let full_error = format!("{}: {}\n{}", ename, evalue, traceback_text);
+
+                            CopyButton::new(full_error).tooltip_label("Copy Full Error")
+                        })
+                        .child(
+                            IconButton::new(
+                                ElementId::Name("open-full-error-in-buffer-traceback".into()),
+                                IconName::FileTextOutlined,
+                            )
+                            .style(ButtonStyle::Transparent)
+                            .tooltip(Tooltip::text("Open Full Error in Buffer"))
+                            .on_click({
+                                let ename = err.ename.clone();
+                                let evalue = err.evalue.clone();
+                                let traceback = err.traceback.clone();
+                                move |_, window, cx| {
+                                    if let Some(workspace) = workspace.upgrade() {
+                                        let traceback_text = traceback.read(cx).full_text();
+                                        let full_error =
+                                            format!("{}: {}\n{}", ename, evalue, traceback_text);
+                                        let buffer = cx.new(|cx| {
+                                            let mut buffer = Buffer::local(full_error, cx)
+                                                .with_language(language::PLAIN_TEXT.clone(), cx);
+                                            buffer
+                                                .set_capability(language::Capability::ReadOnly, cx);
+                                            buffer
+                                        });
+                                        let editor = Box::new(cx.new(|cx| {
+                                            let multibuffer = cx.new(|cx| {
+                                                let mut multi_buffer =
+                                                    MultiBuffer::singleton(buffer.clone(), cx);
+                                                multi_buffer
+                                                    .set_title("Full Error".to_string(), cx);
+                                                multi_buffer
+                                            });
+                                            Editor::for_multibuffer(multibuffer, None, window, cx)
+                                        }));
+                                        workspace.update(cx, |workspace, cx| {
+                                            workspace.add_item_to_active_pane(
+                                                editor, None, true, window, cx,
+                                            );
+                                        });
+                                    }
+                                }
+                            }),
+                        )
+                        .into_any_element(),
                 ),
                 Self::Message(_) => None,
                 Self::Table { content, .. } => {
-                    Self::render_output_controls(content.clone(), workspace.clone(), window, cx)
+                    Self::render_output_controls(content.clone(), workspace, window, cx)
                 }
                 Self::ClearOutputWaitMarker => None,
             })
@@ -400,6 +446,13 @@ impl ExecutionView {
                         self.status = ExecutionStatus::Executing;
                     }
                     ExecutionState::Idle => self.status = ExecutionStatus::Finished,
+                    ExecutionState::Unknown => self.status = ExecutionStatus::Unknown,
+                    ExecutionState::Starting => self.status = ExecutionStatus::ConnectingToKernel,
+                    ExecutionState::Restarting => self.status = ExecutionStatus::Restarting,
+                    ExecutionState::Terminating => self.status = ExecutionStatus::ShuttingDown,
+                    ExecutionState::AutoRestarting => self.status = ExecutionStatus::Restarting,
+                    ExecutionState::Dead => self.status = ExecutionStatus::Shutdown,
+                    ExecutionState::Other(_) => self.status = ExecutionStatus::Unknown,
                 }
                 cx.notify();
                 return;
@@ -410,10 +463,10 @@ impl ExecutionView {
         };
 
         // Check for a clear output marker as the previous output, so we can clear it out
-        if let Some(output) = self.outputs.last() {
-            if let Output::ClearOutputWaitMarker = output {
-                self.outputs.clear();
-            }
+        if let Some(output) = self.outputs.last()
+            && let Output::ClearOutputWaitMarker = output
+        {
+            self.outputs.clear();
         }
 
         self.outputs.push(output);
@@ -431,11 +484,11 @@ impl ExecutionView {
         let mut any = false;
 
         self.outputs.iter_mut().for_each(|output| {
-            if let Some(other_display_id) = output.display_id().as_ref() {
-                if other_display_id == display_id {
-                    *output = Output::new(data, Some(display_id.to_owned()), window, cx);
-                    any = true;
-                }
+            if let Some(other_display_id) = output.display_id().as_ref()
+                && other_display_id == display_id
+            {
+                *output = Output::new(data, Some(display_id.to_owned()), window, cx);
+                any = true;
             }
         });
 
@@ -450,19 +503,18 @@ impl ExecutionView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Output> {
-        if let Some(last_output) = self.outputs.last_mut() {
-            if let Output::Stream {
+        if let Some(last_output) = self.outputs.last_mut()
+            && let Output::Stream {
                 content: last_stream,
             } = last_output
-            {
-                // Don't need to add a new output, we already have a terminal output
-                // and can just update the most recent terminal output
-                last_stream.update(cx, |last_stream, cx| {
-                    last_stream.append_text(text, cx);
-                    cx.notify();
-                });
-                return None;
-            }
+        {
+            // Don't need to add a new output, we already have a terminal output
+            // and can just update the most recent terminal output
+            last_stream.update(cx, |last_stream, cx| {
+                last_stream.append_text(text, cx);
+                cx.notify();
+            });
+            return None;
         }
 
         Some(Output::Stream {
@@ -483,11 +535,7 @@ impl Render for ExecutionView {
                     Icon::new(IconName::ArrowCircle)
                         .size(IconSize::Small)
                         .color(Color::Muted)
-                        .with_animation(
-                            "arrow-circle",
-                            Animation::new(Duration::from_secs(3)).repeat(),
-                            |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
-                        ),
+                        .with_rotate_animation(3),
                 )
                 .child(Label::new("Executing...").color(Color::Muted))
                 .into_any_element(),

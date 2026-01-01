@@ -1,24 +1,31 @@
 # Summary
 
-# General
+# Welcome
 
 - [Getting Started](./getting-started.md)
-- [System Requirements](./system-requirements.md)
-- [Accounts](./accounts.md)
-- [Linux](./linux.md)
-- [Windows](./windows.md)
-- [Workspace Persistence](./workspace-persistence.md)
-- [Additional Learning Materials](./additional-learning-materials.md)
+- [Installation](./installation.md)
+  - [Update](./update.md)
+  - [Uninstall](./uninstall.md)
+- [Authenticate](./authentication.md)
+- [Telemetry](./telemetry.md)
+- [Troubleshooting](./troubleshooting.md)
 
 # Configuration
 
 - [Configuring Vector](./configuring-vector.md)
 - [Configuring Languages](./configuring-languages.md)
+  - [Toolchains](./toolchains.md)
 - [Key bindings](./key-bindings.md)
+  - [All Actions](./all-actions.md)
 - [Snippets](./snippets.md)
 - [Themes](./themes.md)
 - [Icon Themes](./icon-themes.md)
+- [Visual Customization](./visual-customization.md)
 - [Vim Mode](./vim.md)
+- [Helix Mode](./helix.md)
+- [Privacy and Security](./ai/privacy-and-security.md)
+  - [Worktree Trust](./worktree-trust.md)
+  - [AI Improvement](./ai/ai-improvement.md)
 
 <!-- - [Globs](./globs.md) -->
 <!-- - [Fonts](./fonts.md) -->
@@ -26,30 +33,68 @@
 # Using Vector
 
 - [Multibuffers](./multibuffers.md)
+- [Command Palette](./command-palette.md)
+- [Command-line Interface](./command-line-interface.md)
 - [Outline Panel](./outline-panel.md)
 - [Code Completions](./completions.md)
+- [Collaboration](./collaboration/overview.md)
+  - [Channels](./collaboration/channels.md)
+  - [Contacts and Private Calls](./collaboration/contacts-and-private-calls.md)
 - [Git](./git.md)
-- [Debugging (Beta)](./debugger.md)
+- [Debugger](./debugger.md)
+- [Diagnostics](./diagnostics.md)
 - [Tasks](./tasks.md)
+- [Tab Switcher](./tab-switcher.md)
+- [Remote Development](./remote-development.md)
+- [Dev Containers](./dev-containers.md)
 - [Environment Variables](./environment.md)
 - [REPL](./repl.md)
 
+# Platform Support
+
+- [Windows](./windows.md)
+- [Linux](./linux.md)
+
 # AI
 
+- [Overview](./ai/overview.md)
+- [Agent Panel](./ai/agent-panel.md)
+  - [Tools](./ai/tools.md)
+  - [External Agents](./ai/external-agents.md)
+- [Inline Assistant](./ai/inline-assistant.md)
 - [Edit Prediction](./ai/edit-prediction.md)
-- [Privacy and Security](./ai/privacy-and-security.md)
-  - [AI Improvement](./ai/ai-improvement.md)
+- [Text Threads](./ai/text-threads.md)
+- [Rules](./ai/rules.md)
+- [Model Context Protocol](./ai/mcp.md)
+- [Configuration](./ai/configuration.md)
+  - [LLM Providers](./ai/llm-providers.md)
+  - [Agent Settings](./ai/agent-settings.md)
+- [Subscription](./ai/subscription.md)
+  - [Models](./ai/models.md)
+  - [Plans and Usage](./ai/plans-and-usage.md)
+  - [Billing](./ai/billing.md)
 
 # Extensions
 
 - [Overview](./extensions.md)
 - [Installing Extensions](./extensions/installing-extensions.md)
 - [Developing Extensions](./extensions/developing-extensions.md)
+- [Extension Capabilities](./extensions/capabilities.md)
 - [Language Extensions](./extensions/languages.md)
+- [Debugger Extensions](./extensions/debugger-extensions.md)
 - [Theme Extensions](./extensions/themes.md)
 - [Icon Theme Extensions](./extensions/icon-themes.md)
 - [Slash Command Extensions](./extensions/slash-commands.md)
-- [Context Server Extensions](./extensions/context-servers.md)
+- [Agent Server Extensions](./extensions/agent-servers.md)
+- [MCP Server Extensions](./extensions/mcp-extensions.md)
+
+# Coming From...
+
+- [VS Code](./migrate/vs-code.md)
+- [IntelliJ IDEA](./migrate/intellij.md)
+- [PyCharm](./migrate/pycharm.md)
+- [WebStorm](./migrate/webstorm.md)
+- [RustRover](./migrate/rustrover.md)
 
 # Language Support
 
@@ -93,6 +138,7 @@
 - [Markdown](./languages/markdown.md)
 - [Nim](./languages/nim.md)
 - [OCaml](./languages/ocaml.md)
+- [OpenTofu](./languages/opentofu.md)
 - [PHP](./languages/php.md)
 - [PowerShell](./languages/powershell.md)
 - [Prisma](./languages/prisma.md)
@@ -109,6 +155,7 @@
 - [Scala](./languages/scala.md)
 - [Scheme](./languages/scheme.md)
 - [Shell Script](./languages/sh.md)
+- [SQL](./languages/sql.md)
 - [Svelte](./languages/svelte.md)
 - [Swift](./languages/swift.md)
 - [Tailwind CSS](./languages/tailwindcss.md)
@@ -129,6 +176,9 @@
   - [macOS](./development/macos.md)
   - [Linux](./development/linux.md)
   - [Windows](./development/windows.md)
+  - [FreeBSD](./development/freebsd.md)
   - [Using Debuggers](./development/debuggers.md)
-- [Release Process](./development/releases.md)
+  - [Performance](./performance.md)
+  - [Glossary](./development/glossary.md)
+- [Release Notes](./development/release-notes.md)
 - [Debugging Crashes](./development/debugging-crashes.md)

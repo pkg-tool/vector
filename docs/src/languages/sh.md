@@ -8,7 +8,7 @@ Shell Scripts (bash, zsh, dash, sh) are supported natively by Vector.
 
 You can configure various settings for Shell Scripts in your Vector User Settings (`~/.config/vector/settings.json`) or Vector Project Settings (`.vector/settings.json`):
 
-```json
+```json [settings]
   "languages": {
     "Shell Script": {
       "tab_size": 2,
@@ -41,7 +41,7 @@ shfmt --version
 
 3. Configure Vector to automatically format Shell Scripts with `shfmt` on save:
 
-```json
+```json [settings]
   "languages": {
     "Shell Script": {
       "format_on_save": "on",

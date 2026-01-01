@@ -14,45 +14,98 @@
 //! - [`DisplayMap`] that adds background highlights to the regions of text.
 //!   Each one of those builds on top of preceding map.
 //!
+//! ## Structure of the display map layers
+//!
+//! Each layer in the map (and the multibuffer itself to some extent) has a few
+//! structures that are used to implement the public API available to the layer
+//! above:
+//! - a `Transform` type - this represents a region of text that the layer in
+//!   question is "managing", that it transforms into a more "processed" text
+//!   for the layer above. For example, the inlay map has an `enum Transform`
+//!   that has two variants:
+//!     - `Isomorphic`, representing a region of text that has no inlay hints (i.e.
+//!       is passed through the map transparently)
+//!     - `Inlay`, representing a location where an inlay hint is to be inserted.
+//! - a `TransformSummary` type, which is usually a struct with two fields:
+//!   [`input: TextSummary`][`TextSummary`] and [`output: TextSummary`][`TextSummary`]. Here,
+//!   `input` corresponds to "text in the layer below", and `output` corresponds to the text
+//!   exposed to the layer above. So in the inlay map case, a `Transform::Isomorphic`'s summary is
+//!   just `input = output = summary`, where `summary` is the [`TextSummary`] stored in that
+//!   variant. Conversely, a `Transform::Inlay` always has an empty `input` summary, because it's
+//!   not "replacing" any text that exists on disk. The `output` is the summary of the inlay text
+//!   to be injected. - Various newtype wrappers for co-ordinate spaces (e.g. [`WrapRow`]
+//!   represents a row index, after soft-wrapping (and all lower layers)).
+//! - A `Snapshot` type (e.g. [`InlaySnapshot`]) that captures the state of a layer at a specific
+//!   point in time.
+//! - various APIs which drill through the layers below to work with the underlying text. Notably:
+//!   - `fn text_summary_for_offset()` returns a [`TextSummary`] for the range in the co-ordinate
+//!     space that the map in question is responsible for.
+//!   - `fn <A>_point_to_<B>_point()` converts a point in co-ordinate space `A` into co-ordinate
+//!     space `B`.
+//!   - A [`RowInfo`] iterator (e.g. [`InlayBufferRows`]) and a [`Chunk`] iterator
+//!     (e.g. [`InlayChunks`])
+//!   - A `sync` function (e.g. [`InlayMap::sync`]) that takes a snapshot and list of [`Edit<T>`]s,
+//!     and returns a new snapshot and a list of transformed [`Edit<S>`]s. Note that the generic
+//!     parameter on `Edit` changes, since these methods take in edits in the co-ordinate space of
+//!     the lower layer, and return edits in their own co-ordinate space. The term "edit" is
+//!     slightly misleading, since an [`Edit<T>`] doesn't tell you what changed - rather it can be
+//!     thought of as a "region to invalidate". In theory, it would be correct to always use a
+//!     single edit that covers the entire range. However, this would lead to lots of unnecessary
+//!     recalculation.
+//!
+//! See the docs for the [`inlay_map`] module for a more in-depth explanation of how a single layer
+//! works.
+//!
 //! [Editor]: crate::Editor
 //! [EditorElement]: crate::element::EditorElement
+//! [`TextSummary`]: multi_buffer::MBTextSummary
+//! [`WrapRow`]: wrap_map::WrapRow
+//! [`InlayBufferRows`]: inlay_map::InlayBufferRows
+//! [`InlayChunks`]: inlay_map::InlayChunks
+//! [`Edit<T>`]: text::Edit
+//! [`Edit<S>`]: text::Edit
+//! [`Chunk`]: language::Chunk
+
+#[macro_use]
+mod dimensions;
 
 mod block_map;
 mod crease_map;
 mod custom_highlights;
 mod fold_map;
 mod inlay_map;
-pub(crate) mod invisibles;
+mod invisibles;
 mod tab_map;
 mod wrap_map;
 
-use crate::{
-    EditorStyle, InlayId, RowExt, hover_links::InlayHighlight, movement::TextLayoutDetails,
-};
+pub use crate::display_map::{fold_map::FoldMap, inlay_map::InlayMap, tab_map::TabMap};
 pub use block_map::{
     Block, BlockChunks as DisplayChunks, BlockContext, BlockId, BlockMap, BlockPlacement,
     BlockPoint, BlockProperties, BlockRows, BlockStyle, CustomBlockId, EditorMargins, RenderBlock,
     StickyHeaderExcerpt,
 };
-use block_map::{BlockRow, BlockSnapshot};
-use collections::{HashMap, HashSet};
 pub use crease_map::*;
-pub use fold_map::{ChunkRenderer, ChunkRendererContext, Fold, FoldId, FoldPlaceholder, FoldPoint};
-use fold_map::{FoldMap, FoldSnapshot};
-use gpui::{App, Context, Entity, Font, HighlightStyle, LineLayout, Pixels, UnderlineStyle};
-pub use inlay_map::Inlay;
-use inlay_map::{InlayMap, InlaySnapshot};
+pub use fold_map::{
+    ChunkRenderer, ChunkRendererContext, ChunkRendererId, Fold, FoldId, FoldPlaceholder, FoldPoint,
+};
 pub use inlay_map::{InlayOffset, InlayPoint};
 pub use invisibles::{is_invisible, replacement};
-use language::{
-    OffsetUtf16, Point, Subscription as BufferSubscription, language_settings::language_settings,
-};
+
+use collections::{HashMap, HashSet};
+use gpui::{App, Context, Entity, Font, HighlightStyle, LineLayout, Pixels, UnderlineStyle};
+use language::{Point, Subscription as BufferSubscription, language_settings::language_settings};
 use multi_buffer::{
-    Anchor, AnchorRangeExt, ExcerptId, MultiBuffer, MultiBufferPoint, MultiBufferRow,
-    MultiBufferSnapshot, RowInfo, ToOffset, ToPoint,
+    Anchor, AnchorRangeExt, MultiBuffer, MultiBufferOffset, MultiBufferOffsetUtf16,
+    MultiBufferPoint, MultiBufferRow, MultiBufferSnapshot, RowInfo, ToOffset, ToPoint,
 };
+use project::InlayId;
 use project::project_settings::DiagnosticSeverity;
 use serde::Deserialize;
+use sum_tree::{Bias, TreeMap};
+use text::{BufferId, LineIndent};
+use ui::{SharedString, px};
+use unicode_segmentation::UnicodeSegmentation;
+use ztracing::instrument;
 
 use std::{
     any::TypeId,
@@ -63,11 +116,14 @@ use std::{
     ops::{Add, Range, Sub},
     sync::Arc,
 };
-use sum_tree::{Bias, TreeMap};
-use tab_map::{TabMap, TabSnapshot};
-use text::{BufferId, LineIndent};
-use ui::{SharedString, px};
-use unicode_segmentation::UnicodeSegmentation;
+
+use crate::{
+    EditorStyle, RowExt, hover_links::InlayHighlight, inlays::Inlay, movement::TextLayoutDetails,
+};
+use block_map::{BlockRow, BlockSnapshot};
+use fold_map::FoldSnapshot;
+use inlay_map::InlaySnapshot;
+use tab_map::TabSnapshot;
 use wrap_map::{WrapMap, WrapSnapshot};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -76,11 +132,17 @@ pub enum FoldStatus {
     Foldable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum HighlightKey {
+    Type(TypeId),
+    TypePlus(TypeId, usize),
+}
+
 pub trait ToDisplayPoint {
     fn to_display_point(&self, map: &DisplaySnapshot) -> DisplayPoint;
 }
 
-type TextHighlights = TreeMap<TypeId, Arc<(HighlightStyle, Vec<Range<Anchor>>)>>;
+type TextHighlights = TreeMap<HighlightKey, Arc<(HighlightStyle, Vec<Range<Anchor>>)>>;
 type InlayHighlights = TreeMap<TypeId, TreeMap<InlayId, (HighlightStyle, InlayHighlight)>>;
 
 /// Decides how text in a [`MultiBuffer`] should be displayed in a buffer, handling inlay hints,
@@ -90,7 +152,7 @@ type InlayHighlights = TreeMap<TypeId, TreeMap<InlayId, (HighlightStyle, InlayHi
 pub struct DisplayMap {
     /// The buffer that we are displaying.
     buffer: Entity<MultiBuffer>,
-    buffer_subscription: BufferSubscription,
+    buffer_subscription: BufferSubscription<MultiBufferOffset>,
     /// Decides where the [`Inlay`]s should be displayed.
     inlay_map: InlayMap,
     /// Decides where the fold indicators should be and tracks parts of a source file that are currently folded.
@@ -156,24 +218,23 @@ impl DisplayMap {
         }
     }
 
+    #[instrument(skip_all)]
     pub fn snapshot(&mut self, cx: &mut Context<Self>) -> DisplaySnapshot {
+        let tab_size = Self::tab_size(&self.buffer, cx);
+
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
         let edits = self.buffer_subscription.consume().into_inner();
         let (inlay_snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
-        let (fold_snapshot, edits) = self.fold_map.read(inlay_snapshot.clone(), edits);
-        let tab_size = Self::tab_size(&self.buffer, cx);
-        let (tab_snapshot, edits) = self.tab_map.sync(fold_snapshot.clone(), edits, tab_size);
+        let (fold_snapshot, edits) = self.fold_map.read(inlay_snapshot, edits);
+        let (tab_snapshot, edits) = self.tab_map.sync(fold_snapshot, edits, tab_size);
         let (wrap_snapshot, edits) = self
             .wrap_map
-            .update(cx, |map, cx| map.sync(tab_snapshot.clone(), edits, cx));
-        let block_snapshot = self.block_map.read(wrap_snapshot.clone(), edits).snapshot;
+            .update(cx, |map, cx| map.sync(tab_snapshot, edits, cx));
+        let block_snapshot = self.block_map.read(wrap_snapshot, edits).snapshot;
+
+        // todo word diff here?
 
         DisplaySnapshot {
-            buffer_snapshot: self.buffer.read(cx).snapshot(cx),
-            fold_snapshot,
-            inlay_snapshot,
-            tab_snapshot,
-            wrap_snapshot,
             block_snapshot,
             diagnostics_max_severity: self.diagnostics_max_severity,
             crease_snapshot: self.crease_map.snapshot(),
@@ -185,13 +246,14 @@ impl DisplayMap {
         }
     }
 
+    #[instrument(skip_all)]
     pub fn set_state(&mut self, other: &DisplaySnapshot, cx: &mut Context<Self>) {
         self.fold(
             other
-                .folds_in_range(0..other.buffer_snapshot.len())
+                .folds_in_range(MultiBufferOffset(0)..other.buffer_snapshot().len())
                 .map(|fold| {
                     Crease::simple(
-                        fold.range.to_offset(&other.buffer_snapshot),
+                        fold.range.to_offset(other.buffer_snapshot()),
                         fold.placeholder.clone(),
                     )
                 })
@@ -201,6 +263,7 @@ impl DisplayMap {
     }
 
     /// Creates folds for the given creases.
+    #[instrument(skip_all)]
     pub fn fold<T: Clone + ToOffset>(&mut self, creases: Vec<Crease<T>>, cx: &mut Context<Self>) {
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
         let edits = self.buffer_subscription.consume().into_inner();
@@ -263,13 +326,13 @@ impl DisplayMap {
                         height: Some(height),
                         style,
                         priority,
-                        render_in_minimap: true,
                     }
                 }),
         );
     }
 
     /// Removes any folds with the given ranges.
+    #[instrument(skip_all)]
     pub fn remove_folds_with_type<T: ToOffset>(
         &mut self,
         ranges: impl IntoIterator<Item = Range<T>>,
@@ -295,6 +358,7 @@ impl DisplayMap {
     }
 
     /// Removes any folds whose ranges intersect any of the given ranges.
+    #[instrument(skip_all)]
     pub fn unfold_intersecting<T: ToOffset>(
         &mut self,
         ranges: impl IntoIterator<Item = Range<T>>,
@@ -326,6 +390,7 @@ impl DisplayMap {
         block_map.remove_intersecting_replace_blocks(offset_ranges, inclusive);
     }
 
+    #[instrument(skip_all)]
     pub fn disable_header_for_buffer(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let edits = self.buffer_subscription.consume().into_inner();
@@ -340,6 +405,7 @@ impl DisplayMap {
         block_map.disable_header_for_buffer(buffer_id)
     }
 
+    #[instrument(skip_all)]
     pub fn fold_buffers(
         &mut self,
         buffer_ids: impl IntoIterator<Item = language::BufferId>,
@@ -358,6 +424,7 @@ impl DisplayMap {
         block_map.fold_buffers(buffer_ids, self.buffer.read(cx), cx)
     }
 
+    #[instrument(skip_all)]
     pub fn unfold_buffers(
         &mut self,
         buffer_ids: impl IntoIterator<Item = language::BufferId>,
@@ -376,14 +443,17 @@ impl DisplayMap {
         block_map.unfold_buffers(buffer_ids, self.buffer.read(cx), cx)
     }
 
+    #[instrument(skip_all)]
     pub(crate) fn is_buffer_folded(&self, buffer_id: language::BufferId) -> bool {
         self.block_map.folded_buffers.contains(&buffer_id)
     }
 
+    #[instrument(skip_all)]
     pub(crate) fn folded_buffers(&self) -> &HashSet<BufferId> {
         &self.block_map.folded_buffers
     }
 
+    #[instrument(skip_all)]
     pub fn insert_creases(
         &mut self,
         creases: impl IntoIterator<Item = Crease<Anchor>>,
@@ -393,6 +463,7 @@ impl DisplayMap {
         self.crease_map.insert(creases, &snapshot)
     }
 
+    #[instrument(skip_all)]
     pub fn remove_creases(
         &mut self,
         crease_ids: impl IntoIterator<Item = CreaseId>,
@@ -402,6 +473,7 @@ impl DisplayMap {
         self.crease_map.remove(crease_ids, &snapshot)
     }
 
+    #[instrument(skip_all)]
     pub fn insert_blocks(
         &mut self,
         blocks: impl IntoIterator<Item = BlockProperties<Anchor>>,
@@ -420,6 +492,7 @@ impl DisplayMap {
         block_map.insert(blocks)
     }
 
+    #[instrument(skip_all)]
     pub fn resize_blocks(&mut self, heights: HashMap<CustomBlockId, u32>, cx: &mut Context<Self>) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let edits = self.buffer_subscription.consume().into_inner();
@@ -434,10 +507,12 @@ impl DisplayMap {
         block_map.resize(heights);
     }
 
+    #[instrument(skip_all)]
     pub fn replace_blocks(&mut self, renderers: HashMap<CustomBlockId, RenderBlock>) {
         self.block_map.replace_blocks(renderers);
     }
 
+    #[instrument(skip_all)]
     pub fn remove_blocks(&mut self, ids: HashSet<CustomBlockId>, cx: &mut Context<Self>) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let edits = self.buffer_subscription.consume().into_inner();
@@ -452,6 +527,7 @@ impl DisplayMap {
         block_map.remove(ids);
     }
 
+    #[instrument(skip_all)]
     pub fn row_for_block(
         &mut self,
         block_id: CustomBlockId,
@@ -471,16 +547,35 @@ impl DisplayMap {
         Some(DisplayRow(block_row.0))
     }
 
+    #[instrument(skip_all)]
     pub fn highlight_text(
         &mut self,
-        type_id: TypeId,
+        key: HighlightKey,
         ranges: Vec<Range<Anchor>>,
         style: HighlightStyle,
+        merge: bool,
+        cx: &App,
     ) {
-        self.text_highlights
-            .insert(type_id, Arc::new((style, ranges)));
+        let multi_buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let to_insert = match self.text_highlights.remove(&key).filter(|_| merge) {
+            Some(previous) => {
+                let mut merged_ranges = previous.1.clone();
+                for new_range in ranges {
+                    let i = merged_ranges
+                        .binary_search_by(|probe| {
+                            probe.start.cmp(&new_range.start, &multi_buffer_snapshot)
+                        })
+                        .unwrap_or_else(|i| i);
+                    merged_ranges.insert(i, new_range);
+                }
+                Arc::new((style, merged_ranges))
+            }
+            None => Arc::new((style, ranges)),
+        };
+        self.text_highlights.insert(key, to_insert);
     }
 
+    #[instrument(skip_all)]
     pub(crate) fn highlight_inlays(
         &mut self,
         type_id: TypeId,
@@ -500,12 +595,34 @@ impl DisplayMap {
         }
     }
 
+    #[instrument(skip_all)]
     pub fn text_highlights(&self, type_id: TypeId) -> Option<(HighlightStyle, &[Range<Anchor>])> {
-        let highlights = self.text_highlights.get(&type_id)?;
+        let highlights = self.text_highlights.get(&HighlightKey::Type(type_id))?;
         Some((highlights.0, &highlights.1))
     }
+
+    #[cfg(feature = "test-support")]
+    pub fn all_text_highlights(
+        &self,
+    ) -> impl Iterator<Item = &Arc<(HighlightStyle, Vec<Range<Anchor>>)>> {
+        self.text_highlights.values()
+    }
+
+    #[instrument(skip_all)]
     pub fn clear_highlights(&mut self, type_id: TypeId) -> bool {
-        let mut cleared = self.text_highlights.remove(&type_id).is_some();
+        let mut cleared = self
+            .text_highlights
+            .remove(&HighlightKey::Type(type_id))
+            .is_some();
+        self.text_highlights.retain(|key, _| {
+            let retain = if let HighlightKey::TypePlus(key_type_id, _) = key {
+                key_type_id != &type_id
+            } else {
+                true
+            };
+            cleared |= !retain;
+            retain
+        });
         cleared |= self.inlay_highlights.remove(&type_id).is_some();
         cleared
     }
@@ -520,9 +637,10 @@ impl DisplayMap {
             .update(cx, |map, cx| map.set_wrap_width(width, cx))
     }
 
+    #[instrument(skip_all)]
     pub fn update_fold_widths(
         &mut self,
-        widths: impl IntoIterator<Item = (FoldId, Pixels)>,
+        widths: impl IntoIterator<Item = (ChunkRendererId, Pixels)>,
         cx: &mut Context<Self>,
     ) -> bool {
         let snapshot = self.buffer.read(cx).snapshot(cx);
@@ -551,6 +669,7 @@ impl DisplayMap {
         self.inlay_map.current_inlays()
     }
 
+    #[instrument(skip_all)]
     pub(crate) fn splice_inlays(
         &mut self,
         to_remove: &[InlayId],
@@ -580,21 +699,7 @@ impl DisplayMap {
         self.block_map.read(snapshot, edits);
     }
 
-    pub fn remove_inlays_for_excerpts(&mut self, excerpts_removed: &[ExcerptId]) {
-        let to_remove = self
-            .inlay_map
-            .current_inlays()
-            .filter_map(|inlay| {
-                if excerpts_removed.contains(&inlay.position.excerpt_id) {
-                    Some(inlay.id)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        self.inlay_map.splice(&to_remove, Vec::new());
-    }
-
+    #[instrument(skip_all)]
     fn tab_size(buffer: &Entity<MultiBuffer>, cx: &App) -> NonZeroU32 {
         let buffer = buffer.read(cx).as_singleton().map(|buffer| buffer.read(cx));
         let language = buffer
@@ -618,7 +723,7 @@ pub(crate) struct Highlights<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct InlineCompletionStyles {
+pub struct EditPredictionStyles {
     pub insertion: HighlightStyle,
     pub whitespace: HighlightStyle,
 }
@@ -626,7 +731,7 @@ pub struct InlineCompletionStyles {
 #[derive(Default, Debug, Clone, Copy)]
 pub struct HighlightStyles {
     pub inlay_hint: Option<HighlightStyle>,
-    pub inline_completion: Option<InlineCompletionStyles>,
+    pub edit_prediction: Option<EditPredictionStyles>,
 }
 
 #[derive(Clone)]
@@ -639,10 +744,12 @@ pub struct HighlightedChunk<'a> {
     pub text: &'a str,
     pub style: Option<HighlightStyle>,
     pub is_tab: bool,
+    pub is_inlay: bool,
     pub replacement: Option<ChunkReplacement>,
 }
 
 impl<'a> HighlightedChunk<'a> {
+    #[instrument(skip_all)]
     fn highlight_invisibles(
         self,
         editor_style: &'a EditorStyle,
@@ -652,6 +759,7 @@ impl<'a> HighlightedChunk<'a> {
         let style = self.style;
         let is_tab = self.is_tab;
         let renderer = self.replacement;
+        let is_inlay = self.is_inlay;
         iter::from_fn(move || {
             let mut prefix_len = 0;
             while let Some(&ch) = chars.peek() {
@@ -667,6 +775,7 @@ impl<'a> HighlightedChunk<'a> {
                         text: prefix,
                         style,
                         is_tab,
+                        is_inlay,
                         replacement: renderer.clone(),
                     });
                 }
@@ -683,9 +792,8 @@ impl<'a> HighlightedChunk<'a> {
                         }),
                         ..Default::default()
                     };
-                    let invisible_style = if let Some(mut style) = style {
-                        style.highlight(invisible_highlight);
-                        style
+                    let invisible_style = if let Some(style) = style {
+                        style.highlight(invisible_highlight)
                     } else {
                         invisible_highlight
                     };
@@ -693,6 +801,7 @@ impl<'a> HighlightedChunk<'a> {
                         text: prefix,
                         style: Some(invisible_style),
                         is_tab: false,
+                        is_inlay,
                         replacement: Some(ChunkReplacement::Str(replacement.into())),
                     });
                 } else {
@@ -705,9 +814,8 @@ impl<'a> HighlightedChunk<'a> {
                         }),
                         ..Default::default()
                     };
-                    let invisible_style = if let Some(mut style) = style {
-                        style.highlight(invisible_highlight);
-                        style
+                    let invisible_style = if let Some(style) = style {
+                        style.highlight(invisible_highlight)
                     } else {
                         invisible_highlight
                     };
@@ -716,6 +824,7 @@ impl<'a> HighlightedChunk<'a> {
                         text: prefix,
                         style: Some(invisible_style),
                         is_tab: false,
+                        is_inlay,
                         replacement: renderer.clone(),
                     });
                 }
@@ -728,6 +837,7 @@ impl<'a> HighlightedChunk<'a> {
                     text: remainder,
                     style,
                     is_tab,
+                    is_inlay,
                     replacement: renderer.clone(),
                 })
             } else {
@@ -739,12 +849,7 @@ impl<'a> HighlightedChunk<'a> {
 
 #[derive(Clone)]
 pub struct DisplaySnapshot {
-    pub buffer_snapshot: MultiBufferSnapshot,
-    pub fold_snapshot: FoldSnapshot,
     pub crease_snapshot: CreaseSnapshot,
-    inlay_snapshot: InlaySnapshot,
-    tab_snapshot: TabSnapshot,
-    wrap_snapshot: WrapSnapshot,
     block_snapshot: BlockSnapshot,
     text_highlights: TextHighlights,
     inlay_highlights: InlayHighlights,
@@ -755,13 +860,43 @@ pub struct DisplaySnapshot {
 }
 
 impl DisplaySnapshot {
+    pub fn wrap_snapshot(&self) -> &WrapSnapshot {
+        &self.block_snapshot.wrap_snapshot
+    }
+    pub fn tab_snapshot(&self) -> &TabSnapshot {
+        &self.block_snapshot.wrap_snapshot.tab_snapshot
+    }
+
+    pub fn fold_snapshot(&self) -> &FoldSnapshot {
+        &self.block_snapshot.wrap_snapshot.tab_snapshot.fold_snapshot
+    }
+
+    pub fn inlay_snapshot(&self) -> &InlaySnapshot {
+        &self
+            .block_snapshot
+            .wrap_snapshot
+            .tab_snapshot
+            .fold_snapshot
+            .inlay_snapshot
+    }
+
+    pub fn buffer_snapshot(&self) -> &MultiBufferSnapshot {
+        &self
+            .block_snapshot
+            .wrap_snapshot
+            .tab_snapshot
+            .fold_snapshot
+            .inlay_snapshot
+            .buffer
+    }
+
     #[cfg(test)]
     pub fn fold_count(&self) -> usize {
-        self.fold_snapshot.fold_count()
+        self.fold_snapshot().fold_count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffer_snapshot.len() == 0
+        self.buffer_snapshot().len() == MultiBufferOffset(0)
     }
 
     pub fn row_infos(&self, start_row: DisplayRow) -> impl Iterator<Item = RowInfo> + '_ {
@@ -769,16 +904,17 @@ impl DisplaySnapshot {
     }
 
     pub fn widest_line_number(&self) -> u32 {
-        self.buffer_snapshot.widest_line_number()
+        self.buffer_snapshot().widest_line_number()
     }
 
+    #[instrument(skip_all)]
     pub fn prev_line_boundary(&self, mut point: MultiBufferPoint) -> (Point, DisplayPoint) {
         loop {
-            let mut inlay_point = self.inlay_snapshot.to_inlay_point(point);
-            let mut fold_point = self.fold_snapshot.to_fold_point(inlay_point, Bias::Left);
+            let mut inlay_point = self.inlay_snapshot().to_inlay_point(point);
+            let mut fold_point = self.fold_snapshot().to_fold_point(inlay_point, Bias::Left);
             fold_point.0.column = 0;
-            inlay_point = fold_point.to_inlay_point(&self.fold_snapshot);
-            point = self.inlay_snapshot.to_buffer_point(inlay_point);
+            inlay_point = fold_point.to_inlay_point(self.fold_snapshot());
+            point = self.inlay_snapshot().to_buffer_point(inlay_point);
 
             let mut display_point = self.point_to_display_point(point, Bias::Left);
             *display_point.column_mut() = 0;
@@ -790,17 +926,18 @@ impl DisplaySnapshot {
         }
     }
 
+    #[instrument(skip_all)]
     pub fn next_line_boundary(
         &self,
         mut point: MultiBufferPoint,
     ) -> (MultiBufferPoint, DisplayPoint) {
         let original_point = point;
         loop {
-            let mut inlay_point = self.inlay_snapshot.to_inlay_point(point);
-            let mut fold_point = self.fold_snapshot.to_fold_point(inlay_point, Bias::Right);
-            fold_point.0.column = self.fold_snapshot.line_len(fold_point.row());
-            inlay_point = fold_point.to_inlay_point(&self.fold_snapshot);
-            point = self.inlay_snapshot.to_buffer_point(inlay_point);
+            let mut inlay_point = self.inlay_snapshot().to_inlay_point(point);
+            let mut fold_point = self.fold_snapshot().to_fold_point(inlay_point, Bias::Right);
+            fold_point.0.column = self.fold_snapshot().line_len(fold_point.row());
+            inlay_point = fold_point.to_inlay_point(self.fold_snapshot());
+            point = self.inlay_snapshot().to_buffer_point(inlay_point);
 
             let mut display_point = self.point_to_display_point(point, Bias::Right);
             *display_point.column_mut() = self.line_len(display_point.row());
@@ -818,7 +955,8 @@ impl DisplaySnapshot {
         let new_end = if range.end.column > 0 {
             MultiBufferPoint::new(
                 range.end.row,
-                self.buffer_snapshot.line_len(MultiBufferRow(range.end.row)),
+                self.buffer_snapshot()
+                    .line_len(MultiBufferRow(range.end.row)),
             )
         } else {
             range.end
@@ -827,53 +965,62 @@ impl DisplaySnapshot {
         new_start..new_end
     }
 
+    #[instrument(skip_all)]
     pub fn point_to_display_point(&self, point: MultiBufferPoint, bias: Bias) -> DisplayPoint {
-        let inlay_point = self.inlay_snapshot.to_inlay_point(point);
-        let fold_point = self.fold_snapshot.to_fold_point(inlay_point, bias);
-        let tab_point = self.tab_snapshot.to_tab_point(fold_point);
-        let wrap_point = self.wrap_snapshot.tab_point_to_wrap_point(tab_point);
+        let inlay_point = self.inlay_snapshot().to_inlay_point(point);
+        let fold_point = self.fold_snapshot().to_fold_point(inlay_point, bias);
+        let tab_point = self.tab_snapshot().fold_point_to_tab_point(fold_point);
+        let wrap_point = self.wrap_snapshot().tab_point_to_wrap_point(tab_point);
         let block_point = self.block_snapshot.to_block_point(wrap_point);
         DisplayPoint(block_point)
     }
 
     pub fn display_point_to_point(&self, point: DisplayPoint, bias: Bias) -> Point {
-        self.inlay_snapshot
+        self.inlay_snapshot()
             .to_buffer_point(self.display_point_to_inlay_point(point, bias))
     }
 
     pub fn display_point_to_inlay_offset(&self, point: DisplayPoint, bias: Bias) -> InlayOffset {
-        self.inlay_snapshot
+        self.inlay_snapshot()
             .to_offset(self.display_point_to_inlay_point(point, bias))
     }
 
     pub fn anchor_to_inlay_offset(&self, anchor: Anchor) -> InlayOffset {
-        self.inlay_snapshot
-            .to_inlay_offset(anchor.to_offset(&self.buffer_snapshot))
+        self.inlay_snapshot()
+            .to_inlay_offset(anchor.to_offset(self.buffer_snapshot()))
     }
 
     pub fn display_point_to_anchor(&self, point: DisplayPoint, bias: Bias) -> Anchor {
-        self.buffer_snapshot
+        self.buffer_snapshot()
             .anchor_at(point.to_offset(self, bias), bias)
     }
 
+    #[instrument(skip_all)]
     fn display_point_to_inlay_point(&self, point: DisplayPoint, bias: Bias) -> InlayPoint {
         let block_point = point.0;
         let wrap_point = self.block_snapshot.to_wrap_point(block_point, bias);
-        let tab_point = self.wrap_snapshot.to_tab_point(wrap_point);
-        let fold_point = self.tab_snapshot.to_fold_point(tab_point, bias).0;
-        fold_point.to_inlay_point(&self.fold_snapshot)
+        let tab_point = self.wrap_snapshot().to_tab_point(wrap_point);
+        let fold_point = self
+            .tab_snapshot()
+            .tab_point_to_fold_point(tab_point, bias)
+            .0;
+        fold_point.to_inlay_point(self.fold_snapshot())
     }
 
+    #[instrument(skip_all)]
     pub fn display_point_to_fold_point(&self, point: DisplayPoint, bias: Bias) -> FoldPoint {
         let block_point = point.0;
         let wrap_point = self.block_snapshot.to_wrap_point(block_point, bias);
-        let tab_point = self.wrap_snapshot.to_tab_point(wrap_point);
-        self.tab_snapshot.to_fold_point(tab_point, bias).0
+        let tab_point = self.wrap_snapshot().to_tab_point(wrap_point);
+        self.tab_snapshot()
+            .tab_point_to_fold_point(tab_point, bias)
+            .0
     }
 
+    #[instrument(skip_all)]
     pub fn fold_point_to_display_point(&self, fold_point: FoldPoint) -> DisplayPoint {
-        let tab_point = self.tab_snapshot.to_tab_point(fold_point);
-        let wrap_point = self.wrap_snapshot.tab_point_to_wrap_point(tab_point);
+        let tab_point = self.tab_snapshot().fold_point_to_tab_point(fold_point);
+        let wrap_point = self.wrap_snapshot().tab_point_to_wrap_point(tab_point);
         let block_point = self.block_snapshot.to_block_point(wrap_point);
         DisplayPoint(block_point)
     }
@@ -883,10 +1030,11 @@ impl DisplaySnapshot {
     }
 
     /// Returns text chunks starting at the given display row until the end of the file
+    #[instrument(skip_all)]
     pub fn text_chunks(&self, display_row: DisplayRow) -> impl Iterator<Item = &str> {
         self.block_snapshot
             .chunks(
-                display_row.0..self.max_point().row().next_row().0,
+                BlockRow(display_row.0)..BlockRow(self.max_point().row().next_row().0),
                 false,
                 self.masked,
                 Highlights::default(),
@@ -895,10 +1043,16 @@ impl DisplaySnapshot {
     }
 
     /// Returns text chunks starting at the end of the given display row in reverse until the start of the file
+    #[instrument(skip_all)]
     pub fn reverse_text_chunks(&self, display_row: DisplayRow) -> impl Iterator<Item = &str> {
         (0..=display_row.0).rev().flat_map(move |row| {
             self.block_snapshot
-                .chunks(row..row + 1, false, self.masked, Highlights::default())
+                .chunks(
+                    BlockRow(row)..BlockRow(row + 1),
+                    false,
+                    self.masked,
+                    Highlights::default(),
+                )
                 .map(|h| h.text)
                 .collect::<Vec<_>>()
                 .into_iter()
@@ -906,6 +1060,7 @@ impl DisplaySnapshot {
         })
     }
 
+    #[instrument(skip_all)]
     pub fn chunks(
         &self,
         display_rows: Range<DisplayRow>,
@@ -913,7 +1068,7 @@ impl DisplaySnapshot {
         highlight_styles: HighlightStyles,
     ) -> DisplayChunks<'_> {
         self.block_snapshot.chunks(
-            display_rows.start.0..display_rows.end.0,
+            BlockRow(display_rows.start.0)..BlockRow(display_rows.end.0),
             language_aware,
             self.masked,
             Highlights {
@@ -924,6 +1079,7 @@ impl DisplaySnapshot {
         )
     }
 
+    #[instrument(skip_all)]
     pub fn highlighted_chunks<'a>(
         &'a self,
         display_rows: Range<DisplayRow>,
@@ -935,58 +1091,72 @@ impl DisplaySnapshot {
             language_aware,
             HighlightStyles {
                 inlay_hint: Some(editor_style.inlay_hints_style),
-                inline_completion: Some(editor_style.inline_completion_styles),
+                edit_prediction: Some(editor_style.edit_prediction_styles),
             },
         )
         .flat_map(|chunk| {
-            let mut highlight_style = chunk
+            let highlight_style = chunk
                 .syntax_highlight_id
                 .and_then(|id| id.style(&editor_style.syntax));
 
-            if let Some(chunk_highlight) = chunk.highlight_style {
-                if let Some(highlight_style) = highlight_style.as_mut() {
-                    highlight_style.highlight(chunk_highlight);
-                } else {
-                    highlight_style = Some(chunk_highlight);
+            let chunk_highlight = chunk.highlight_style.map(|chunk_highlight| {
+                HighlightStyle {
+                    // For color inlays, blend the color with the editor background
+                    // if the color has transparency (alpha < 1.0)
+                    color: chunk_highlight.color.map(|color| {
+                        if chunk.is_inlay && !color.is_opaque() {
+                            editor_style.background.blend(color)
+                        } else {
+                            color
+                        }
+                    }),
+                    ..chunk_highlight
                 }
-            }
+            });
 
-            let mut diagnostic_highlight = HighlightStyle::default();
+            let diagnostic_highlight = chunk
+                .diagnostic_severity
+                .filter(|severity| {
+                    self.diagnostics_max_severity
+                        .into_lsp()
+                        .is_some_and(|max_severity| severity <= &max_severity)
+                })
+                .map(|severity| HighlightStyle {
+                    fade_out: chunk
+                        .is_unnecessary
+                        .then_some(editor_style.unnecessary_code_fade),
+                    underline: (chunk.underline
+                        && editor_style.show_underlines
+                        && !(chunk.is_unnecessary && severity > lsp::DiagnosticSeverity::WARNING))
+                        .then(|| {
+                            let diagnostic_color =
+                                super::diagnostic_style(severity, &editor_style.status);
+                            UnderlineStyle {
+                                color: Some(diagnostic_color),
+                                thickness: 1.0.into(),
+                                wavy: true,
+                            }
+                        }),
+                    ..Default::default()
+                });
 
-            if let Some(severity) = chunk.diagnostic_severity.filter(|severity| {
-                self.diagnostics_max_severity
-                    .into_lsp()
-                    .map_or(false, |max_severity| severity <= &max_severity)
-            }) {
-                if chunk.is_unnecessary {
-                    diagnostic_highlight.fade_out = Some(editor_style.unnecessary_code_fade);
-                }
-                if chunk.underline && editor_style.show_underlines {
-                    let diagnostic_color = super::diagnostic_style(severity, &editor_style.status);
-                    diagnostic_highlight.underline = Some(UnderlineStyle {
-                        color: Some(diagnostic_color),
-                        thickness: 1.0.into(),
-                        wavy: true,
-                    });
-                }
-            }
-
-            if let Some(highlight_style) = highlight_style.as_mut() {
-                highlight_style.highlight(diagnostic_highlight);
-            } else {
-                highlight_style = Some(diagnostic_highlight);
-            }
+            let style = [highlight_style, chunk_highlight, diagnostic_highlight]
+                .into_iter()
+                .flatten()
+                .reduce(|acc, highlight| acc.highlight(highlight));
 
             HighlightedChunk {
                 text: chunk.text,
-                style: highlight_style,
+                style,
                 is_tab: chunk.is_tab,
+                is_inlay: chunk.is_inlay,
                 replacement: chunk.renderer.map(ChunkReplacement::Renderer),
             }
             .highlight_invisibles(editor_style)
         })
     }
 
+    #[instrument(skip_all)]
     pub fn layout_row(
         &self,
         display_row: DisplayRow,
@@ -1026,7 +1196,7 @@ impl DisplaySnapshot {
         }
 
         let font_size = editor_style.text.font_size.to_pixels(*rem_size);
-        text_system.layout_line(&line, font_size, &runs)
+        text_system.layout_line(&line, font_size, &runs, None)
     }
 
     pub fn x_for_display_point(
@@ -1048,6 +1218,7 @@ impl DisplaySnapshot {
         layout_line.closest_index_for_x(x) as u32
     }
 
+    #[instrument(skip_all)]
     pub fn grapheme_at(&self, mut point: DisplayPoint) -> Option<SharedString> {
         point = DisplayPoint(self.block_snapshot.clip_point(point.0, Bias::Left));
         let chars = self
@@ -1081,8 +1252,11 @@ impl DisplaySnapshot {
         })
     }
 
-    pub fn buffer_chars_at(&self, mut offset: usize) -> impl Iterator<Item = (char, usize)> + '_ {
-        self.buffer_snapshot.chars_at(offset).map(move |ch| {
+    pub fn buffer_chars_at(
+        &self,
+        mut offset: MultiBufferOffset,
+    ) -> impl Iterator<Item = (char, MultiBufferOffset)> + '_ {
+        self.buffer_snapshot().chars_at(offset).map(move |ch| {
             let ret = (ch, offset);
             offset += ch.len_utf8();
             ret
@@ -1091,9 +1265,9 @@ impl DisplaySnapshot {
 
     pub fn reverse_buffer_chars_at(
         &self,
-        mut offset: usize,
-    ) -> impl Iterator<Item = (char, usize)> + '_ {
-        self.buffer_snapshot
+        mut offset: MultiBufferOffset,
+    ) -> impl Iterator<Item = (char, MultiBufferOffset)> + '_ {
+        self.buffer_snapshot()
             .reversed_chars_at(offset)
             .map(move |ch| {
                 offset -= ch.len_utf8();
@@ -1116,11 +1290,11 @@ impl DisplaySnapshot {
     pub fn clip_at_line_end(&self, display_point: DisplayPoint) -> DisplayPoint {
         let mut point = self.display_point_to_point(display_point, Bias::Left);
 
-        if point.column != self.buffer_snapshot.line_len(MultiBufferRow(point.row)) {
+        if point.column != self.buffer_snapshot().line_len(MultiBufferRow(point.row)) {
             return display_point;
         }
         point.column = point.column.saturating_sub(1);
-        point = self.buffer_snapshot.clip_point(point, Bias::Left);
+        point = self.buffer_snapshot().clip_point(point, Bias::Left);
         self.point_to_display_point(point, Bias::Left)
     }
 
@@ -1128,7 +1302,7 @@ impl DisplaySnapshot {
     where
         T: ToOffset,
     {
-        self.fold_snapshot.folds_in_range(range)
+        self.fold_snapshot().folds_in_range(range)
     }
 
     pub fn blocks_in_range(
@@ -1136,11 +1310,11 @@ impl DisplaySnapshot {
         rows: Range<DisplayRow>,
     ) -> impl Iterator<Item = (DisplayRow, &Block)> {
         self.block_snapshot
-            .blocks_in_range(rows.start.0..rows.end.0)
-            .map(|(row, block)| (DisplayRow(row), block))
+            .blocks_in_range(BlockRow(rows.start.0)..BlockRow(rows.end.0))
+            .map(|(row, block)| (DisplayRow(row.0), block))
     }
 
-    pub fn sticky_header_excerpt(&self, row: f32) -> Option<StickyHeaderExcerpt<'_>> {
+    pub fn sticky_header_excerpt(&self, row: f64) -> Option<StickyHeaderExcerpt<'_>> {
         self.block_snapshot.sticky_header_excerpt(row)
     }
 
@@ -1149,12 +1323,12 @@ impl DisplaySnapshot {
     }
 
     pub fn intersects_fold<T: ToOffset>(&self, offset: T) -> bool {
-        self.fold_snapshot.intersects_fold(offset)
+        self.fold_snapshot().intersects_fold(offset)
     }
 
     pub fn is_line_folded(&self, buffer_row: MultiBufferRow) -> bool {
         self.block_snapshot.is_line_replaced(buffer_row)
-            || self.fold_snapshot.is_line_folded(buffer_row)
+            || self.fold_snapshot().is_line_folded(buffer_row)
     }
 
     pub fn is_block_line(&self, display_row: DisplayRow) -> bool {
@@ -1169,9 +1343,9 @@ impl DisplaySnapshot {
     pub fn soft_wrap_indent(&self, display_row: DisplayRow) -> Option<u32> {
         let wrap_row = self
             .block_snapshot
-            .to_wrap_point(BlockPoint::new(display_row.0, 0), Bias::Left)
+            .to_wrap_point(BlockPoint::new(BlockRow(display_row.0), 0), Bias::Left)
             .row();
-        self.wrap_snapshot.soft_wrap_indent(wrap_row)
+        self.wrap_snapshot().soft_wrap_indent(wrap_row)
     }
 
     pub fn text(&self) -> String {
@@ -1192,7 +1366,7 @@ impl DisplaySnapshot {
     }
 
     pub fn line_indent_for_buffer_row(&self, buffer_row: MultiBufferRow) -> LineIndent {
-        self.buffer_snapshot.line_indent_for_row(buffer_row)
+        self.buffer_snapshot().line_indent_for_row(buffer_row)
     }
 
     pub fn line_len(&self, row: DisplayRow) -> u32 {
@@ -1200,7 +1374,7 @@ impl DisplaySnapshot {
     }
 
     pub fn longest_row(&self) -> DisplayRow {
-        DisplayRow(self.block_snapshot.longest_row())
+        DisplayRow(self.block_snapshot.longest_row().0)
     }
 
     pub fn longest_row_in_range(&self, range: Range<DisplayRow>) -> DisplayRow {
@@ -1210,7 +1384,7 @@ impl DisplaySnapshot {
     }
 
     pub fn starts_indent(&self, buffer_row: MultiBufferRow) -> bool {
-        let max_row = self.buffer_snapshot.max_row();
+        let max_row = self.buffer_snapshot().max_row();
         if buffer_row >= max_row {
             return false;
         }
@@ -1234,11 +1408,13 @@ impl DisplaySnapshot {
             .unwrap_or(false)
     }
 
+    #[instrument(skip_all)]
     pub fn crease_for_buffer_row(&self, buffer_row: MultiBufferRow) -> Option<Crease<Point>> {
-        let start = MultiBufferPoint::new(buffer_row.0, self.buffer_snapshot.line_len(buffer_row));
+        let start =
+            MultiBufferPoint::new(buffer_row.0, self.buffer_snapshot().line_len(buffer_row));
         if let Some(crease) = self
             .crease_snapshot
-            .query_row(buffer_row, &self.buffer_snapshot)
+            .query_row(buffer_row, self.buffer_snapshot())
         {
             match crease {
                 Crease::Inline {
@@ -1248,7 +1424,7 @@ impl DisplaySnapshot {
                     render_trailer,
                     metadata,
                 } => Some(Crease::Inline {
-                    range: range.to_point(&self.buffer_snapshot),
+                    range: range.to_point(self.buffer_snapshot()),
                     placeholder: placeholder.clone(),
                     render_toggle: render_toggle.clone(),
                     render_trailer: render_trailer.clone(),
@@ -1262,7 +1438,7 @@ impl DisplaySnapshot {
                     block_priority,
                     render_toggle,
                 } => Some(Crease::Block {
-                    range: range.to_point(&self.buffer_snapshot),
+                    range: range.to_point(self.buffer_snapshot()),
                     block_height: *block_height,
                     block_style: *block_style,
                     render_block: render_block.clone(),
@@ -1274,7 +1450,7 @@ impl DisplaySnapshot {
             && !self.is_line_folded(MultiBufferRow(start.row))
         {
             let start_line_indent = self.line_indent_for_buffer_row(buffer_row);
-            let max_point = self.buffer_snapshot.max_point();
+            let max_point = self.buffer_snapshot().max_point();
             let mut end = None;
 
             for row in (buffer_row.0 + 1)..=max_point.row {
@@ -1285,7 +1461,7 @@ impl DisplaySnapshot {
                     let prev_row = row - 1;
                     end = Some(Point::new(
                         prev_row,
-                        self.buffer_snapshot.line_len(MultiBufferRow(prev_row)),
+                        self.buffer_snapshot().line_len(MultiBufferRow(prev_row)),
                     ));
                     break;
                 }
@@ -1294,7 +1470,7 @@ impl DisplaySnapshot {
             let mut row_before_line_breaks = end.unwrap_or(max_point);
             while row_before_line_breaks.row > start.row
                 && self
-                    .buffer_snapshot
+                    .buffer_snapshot()
                     .is_line_blank(MultiBufferRow(row_before_line_breaks.row))
             {
                 row_before_line_breaks.row -= 1;
@@ -1302,7 +1478,7 @@ impl DisplaySnapshot {
 
             row_before_line_breaks = Point::new(
                 row_before_line_breaks.row,
-                self.buffer_snapshot
+                self.buffer_snapshot()
                     .line_len(MultiBufferRow(row_before_line_breaks.row)),
             );
 
@@ -1319,11 +1495,42 @@ impl DisplaySnapshot {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[instrument(skip_all)]
     pub fn text_highlight_ranges<Tag: ?Sized + 'static>(
         &self,
     ) -> Option<Arc<(HighlightStyle, Vec<Range<Anchor>>)>> {
         let type_id = TypeId::of::<Tag>();
-        self.text_highlights.get(&type_id).cloned()
+        self.text_highlights
+            .get(&HighlightKey::Type(type_id))
+            .cloned()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[instrument(skip_all)]
+    pub fn all_text_highlight_ranges<Tag: ?Sized + 'static>(
+        &self,
+    ) -> Vec<(gpui::Hsla, Range<Point>)> {
+        use itertools::Itertools;
+
+        let required_type_id = TypeId::of::<Tag>();
+        self.text_highlights
+            .iter()
+            .filter(|(key, _)| match key {
+                HighlightKey::Type(type_id) => type_id == &required_type_id,
+                HighlightKey::TypePlus(type_id, _) => type_id == &required_type_id,
+            })
+            .map(|(_, value)| value.clone())
+            .flat_map(|ranges| {
+                ranges
+                    .1
+                    .iter()
+                    .flat_map(|range| {
+                        Some((ranges.0.color?, range.to_point(self.buffer_snapshot())))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .sorted_by_key(|(_, range)| range.start)
+            .collect()
     }
 
     #[allow(unused)]
@@ -1342,8 +1549,38 @@ impl DisplaySnapshot {
     pub fn excerpt_header_height(&self) -> u32 {
         self.block_snapshot.excerpt_header_height
     }
+
+    /// Given a `DisplayPoint`, returns another `DisplayPoint` corresponding to
+    /// the start of the buffer row that is a given number of buffer rows away
+    /// from the provided point.
+    ///
+    /// This moves by buffer rows instead of display rows, a distinction that is
+    /// important when soft wrapping is enabled.
+    #[instrument(skip_all)]
+    pub fn start_of_relative_buffer_row(&self, point: DisplayPoint, times: isize) -> DisplayPoint {
+        let start = self.display_point_to_fold_point(point, Bias::Left);
+        let target = start.row() as isize + times;
+        let new_row = (target.max(0) as u32).min(self.fold_snapshot().max_point().row());
+
+        self.clip_point(
+            self.fold_point_to_display_point(
+                self.fold_snapshot()
+                    .clip_point(FoldPoint::new(new_row, 0), Bias::Right),
+            ),
+            Bias::Right,
+        )
+    }
 }
 
+impl std::ops::Deref for DisplaySnapshot {
+    type Target = BlockSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.block_snapshot
+    }
+}
+
+/// A zero-indexed point in a text buffer consisting of a row and column adjusted for inserted blocks.
 #[derive(Copy, Clone, Default, Eq, Ord, PartialOrd, PartialEq)]
 pub struct DisplayPoint(BlockPoint);
 
@@ -1442,25 +1679,28 @@ impl DisplayPoint {
         map.display_point_to_point(self, Bias::Left)
     }
 
-    pub fn to_offset(self, map: &DisplaySnapshot, bias: Bias) -> usize {
+    pub fn to_offset(self, map: &DisplaySnapshot, bias: Bias) -> MultiBufferOffset {
         let wrap_point = map.block_snapshot.to_wrap_point(self.0, bias);
-        let tab_point = map.wrap_snapshot.to_tab_point(wrap_point);
-        let fold_point = map.tab_snapshot.to_fold_point(tab_point, bias).0;
-        let inlay_point = fold_point.to_inlay_point(&map.fold_snapshot);
-        map.inlay_snapshot
-            .to_buffer_offset(map.inlay_snapshot.to_offset(inlay_point))
+        let tab_point = map.wrap_snapshot().to_tab_point(wrap_point);
+        let fold_point = map
+            .tab_snapshot()
+            .tab_point_to_fold_point(tab_point, bias)
+            .0;
+        let inlay_point = fold_point.to_inlay_point(map.fold_snapshot());
+        map.inlay_snapshot()
+            .to_buffer_offset(map.inlay_snapshot().to_offset(inlay_point))
     }
 }
 
-impl ToDisplayPoint for usize {
+impl ToDisplayPoint for MultiBufferOffset {
     fn to_display_point(&self, map: &DisplaySnapshot) -> DisplayPoint {
-        map.point_to_display_point(self.to_point(&map.buffer_snapshot), Bias::Left)
+        map.point_to_display_point(self.to_point(map.buffer_snapshot()), Bias::Left)
     }
 }
 
-impl ToDisplayPoint for OffsetUtf16 {
+impl ToDisplayPoint for MultiBufferOffsetUtf16 {
     fn to_display_point(&self, map: &DisplaySnapshot) -> DisplayPoint {
-        self.to_offset(&map.buffer_snapshot).to_display_point(map)
+        self.to_offset(map.buffer_snapshot()).to_display_point(map)
     }
 }
 
@@ -1472,7 +1712,7 @@ impl ToDisplayPoint for Point {
 
 impl ToDisplayPoint for Anchor {
     fn to_display_point(&self, map: &DisplaySnapshot) -> DisplayPoint {
-        self.to_point(&map.buffer_snapshot).to_display_point(map)
+        self.to_point(map.buffer_snapshot()).to_display_point(map)
     }
 }
 
@@ -1491,12 +1731,11 @@ pub mod tests {
     use language::{
         Buffer, Diagnostic, DiagnosticEntry, DiagnosticSet, Language, LanguageConfig,
         LanguageMatcher,
-        language_settings::{AllLanguageSettings, AllLanguageSettingsContent},
     };
     use lsp::LanguageServerId;
-    use project::Project;
+
     use rand::{Rng, prelude::*};
-    use settings::SettingsStore;
+    use settings::{SettingsContent, SettingsStore};
     use smol::stream::StreamExt;
     use std::{env, sync::Arc};
     use text::PointUtf16;
@@ -1511,27 +1750,29 @@ pub mod tests {
             .map(|i| i.parse().expect("invalid `OPERATIONS` variable"))
             .unwrap_or(10);
 
-        let mut tab_size = rng.gen_range(1..=4);
-        let buffer_start_excerpt_header_height = rng.gen_range(1..=5);
-        let excerpt_header_height = rng.gen_range(1..=5);
+        let mut tab_size = rng.random_range(1..=4);
+        let buffer_start_excerpt_header_height = rng.random_range(1..=5);
+        let excerpt_header_height = rng.random_range(1..=5);
         let font_size = px(14.0);
         let max_wrap_width = 300.0;
-        let mut wrap_width = if rng.gen_bool(0.1) {
+        let mut wrap_width = if rng.random_bool(0.1) {
             None
         } else {
-            Some(px(rng.gen_range(0.0..=max_wrap_width)))
+            Some(px(rng.random_range(0.0..=max_wrap_width)))
         };
 
         log::info!("tab size: {}", tab_size);
         log::info!("wrap width: {:?}", wrap_width);
 
         cx.update(|cx| {
-            init_test(cx, |s| s.defaults.tab_size = NonZeroU32::new(tab_size));
+            init_test(cx, |s| {
+                s.project.all_languages.defaults.tab_size = NonZeroU32::new(tab_size)
+            });
         });
 
         let buffer = cx.update(|cx| {
-            if rng.r#gen() {
-                let len = rng.gen_range(0..10);
+            if rng.random() {
+                let len = rng.random_range(0..10);
                 let text = util::RandomCharIter::new(&mut rng)
                     .take(len)
                     .collect::<String>();
@@ -1560,20 +1801,20 @@ pub mod tests {
         let mut blocks = Vec::new();
 
         let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
-        log::info!("buffer text: {:?}", snapshot.buffer_snapshot.text());
-        log::info!("fold text: {:?}", snapshot.fold_snapshot.text());
-        log::info!("tab text: {:?}", snapshot.tab_snapshot.text());
-        log::info!("wrap text: {:?}", snapshot.wrap_snapshot.text());
+        log::info!("buffer text: {:?}", snapshot.buffer_snapshot().text());
+        log::info!("fold text: {:?}", snapshot.fold_snapshot().text());
+        log::info!("tab text: {:?}", snapshot.tab_snapshot().text());
+        log::info!("wrap text: {:?}", snapshot.wrap_snapshot().text());
         log::info!("block text: {:?}", snapshot.block_snapshot.text());
         log::info!("display text: {:?}", snapshot.text());
 
         for _i in 0..operations {
-            match rng.gen_range(0..100) {
+            match rng.random_range(0..100) {
                 0..=19 => {
-                    wrap_width = if rng.gen_bool(0.2) {
+                    wrap_width = if rng.random_bool(0.2) {
                         None
                     } else {
-                        Some(px(rng.gen_range(0.0..=max_wrap_width)))
+                        Some(px(rng.random_range(0.0..=max_wrap_width)))
                     };
                     log::info!("setting wrap width to {:?}", wrap_width);
                     map.update(cx, |map, cx| map.set_wrap_width(wrap_width, cx));
@@ -1585,52 +1826,52 @@ pub mod tests {
                     log::info!("setting tab size to {:?}", tab_size);
                     cx.update(|cx| {
                         cx.update_global::<SettingsStore, _>(|store, cx| {
-                            store.update_user_settings::<AllLanguageSettings>(cx, |s| {
-                                s.defaults.tab_size = NonZeroU32::new(tab_size);
+                            store.update_user_settings(cx, |s| {
+                                s.project.all_languages.defaults.tab_size =
+                                    NonZeroU32::new(tab_size);
                             });
                         });
                     });
                 }
                 30..=44 => {
                     map.update(cx, |map, cx| {
-                        if rng.r#gen() || blocks.is_empty() {
-                            let buffer = map.snapshot(cx).buffer_snapshot;
-                            let block_properties = (0..rng.gen_range(1..=1))
+                        if rng.random() || blocks.is_empty() {
+                            let snapshot = map.snapshot(cx);
+                            let buffer = snapshot.buffer_snapshot();
+                            let block_properties = (0..rng.random_range(1..=1))
                                 .map(|_| {
-                                    let position =
-                                        buffer.anchor_after(buffer.clip_offset(
-                                            rng.gen_range(0..=buffer.len()),
-                                            Bias::Left,
-                                        ));
+                                    let position = buffer.anchor_after(buffer.clip_offset(
+                                        rng.random_range(MultiBufferOffset(0)..=buffer.len()),
+                                        Bias::Left,
+                                    ));
 
-                                    let placement = if rng.r#gen() {
+                                    let placement = if rng.random() {
                                         BlockPlacement::Above(position)
                                     } else {
                                         BlockPlacement::Below(position)
                                     };
-                                    let height = rng.gen_range(1..5);
+                                    let height = rng.random_range(1..5);
                                     log::info!(
                                         "inserting block {:?} with height {}",
                                         placement.as_ref().map(|p| p.to_point(&buffer)),
                                         height
                                     );
-                                    let priority = rng.gen_range(1..100);
+                                    let priority = rng.random_range(1..100);
                                     BlockProperties {
                                         placement,
                                         style: BlockStyle::Fixed,
                                         height: Some(height),
                                         render: Arc::new(|_| div().into_any()),
                                         priority,
-                                        render_in_minimap: true,
                                     }
                                 })
                                 .collect::<Vec<_>>();
                             blocks.extend(map.insert_blocks(block_properties, cx));
                         } else {
                             blocks.shuffle(&mut rng);
-                            let remove_count = rng.gen_range(1..=4.min(blocks.len()));
+                            let remove_count = rng.random_range(1..=4.min(blocks.len()));
                             let block_ids_to_remove = (0..remove_count)
-                                .map(|_| blocks.remove(rng.gen_range(0..blocks.len())))
+                                .map(|_| blocks.remove(rng.random_range(0..blocks.len())))
                                 .collect();
                             log::info!("removing block ids {:?}", block_ids_to_remove);
                             map.remove_blocks(block_ids_to_remove, cx);
@@ -1639,16 +1880,20 @@ pub mod tests {
                 }
                 45..=79 => {
                     let mut ranges = Vec::new();
-                    for _ in 0..rng.gen_range(1..=3) {
+                    for _ in 0..rng.random_range(1..=3) {
                         buffer.read_with(cx, |buffer, cx| {
                             let buffer = buffer.read(cx);
-                            let end = buffer.clip_offset(rng.gen_range(0..=buffer.len()), Right);
-                            let start = buffer.clip_offset(rng.gen_range(0..=end), Left);
+                            let end = buffer.clip_offset(
+                                rng.random_range(MultiBufferOffset(0)..=buffer.len()),
+                                Right,
+                            );
+                            let start = buffer
+                                .clip_offset(rng.random_range(MultiBufferOffset(0)..=end), Left);
                             ranges.push(start..end);
                         });
                     }
 
-                    if rng.r#gen() && fold_count > 0 {
+                    if rng.random() && fold_count > 0 {
                         log::info!("unfolding ranges: {:?}", ranges);
                         map.update(cx, |map, cx| {
                             map.unfold_intersecting(ranges, true, cx);
@@ -1677,18 +1922,18 @@ pub mod tests {
 
             let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
             fold_count = snapshot.fold_count();
-            log::info!("buffer text: {:?}", snapshot.buffer_snapshot.text());
-            log::info!("fold text: {:?}", snapshot.fold_snapshot.text());
-            log::info!("tab text: {:?}", snapshot.tab_snapshot.text());
-            log::info!("wrap text: {:?}", snapshot.wrap_snapshot.text());
+            log::info!("buffer text: {:?}", snapshot.buffer_snapshot().text());
+            log::info!("fold text: {:?}", snapshot.fold_snapshot().text());
+            log::info!("tab text: {:?}", snapshot.tab_snapshot().text());
+            log::info!("wrap text: {:?}", snapshot.wrap_snapshot().text());
             log::info!("block text: {:?}", snapshot.block_snapshot.text());
             log::info!("display text: {:?}", snapshot.text());
 
             // Line boundaries
-            let buffer = &snapshot.buffer_snapshot;
+            let buffer = snapshot.buffer_snapshot();
             for _ in 0..5 {
-                let row = rng.gen_range(0..=buffer.max_point().row);
-                let column = rng.gen_range(0..=buffer.line_len(MultiBufferRow(row)));
+                let row = rng.random_range(0..=buffer.max_point().row);
+                let column = rng.random_range(0..=buffer.line_len(MultiBufferRow(row)));
                 let point = buffer.clip_point(Point::new(row, column), Left);
 
                 let (prev_buffer_bound, prev_display_bound) = snapshot.prev_line_boundary(point);
@@ -1736,8 +1981,8 @@ pub mod tests {
             let min_point = snapshot.clip_point(DisplayPoint::new(DisplayRow(0), 0), Left);
             let max_point = snapshot.clip_point(snapshot.max_point(), Right);
             for _ in 0..5 {
-                let row = rng.gen_range(0..=snapshot.max_point().row().0);
-                let column = rng.gen_range(0..=snapshot.line_len(DisplayRow(row)));
+                let row = rng.random_range(0..=snapshot.max_point().row().0);
+                let column = rng.random_range(0..=snapshot.line_len(DisplayRow(row)));
                 let point = snapshot.clip_point(DisplayPoint::new(DisplayRow(row), column), Left);
 
                 log::info!("Moving from point {:?}", point);
@@ -1839,37 +2084,37 @@ pub mod tests {
                 ),
                 (
                     DisplayPoint::new(DisplayRow(0), 7),
-                    language::SelectionGoal::HorizontalPosition(x.0)
+                    language::SelectionGoal::HorizontalPosition(f64::from(x))
                 )
             );
             assert_eq!(
                 movement::down(
                     &snapshot,
                     DisplayPoint::new(DisplayRow(0), 7),
-                    language::SelectionGoal::HorizontalPosition(x.0),
+                    language::SelectionGoal::HorizontalPosition(f64::from(x)),
                     false,
                     &text_layout_details
                 ),
                 (
                     DisplayPoint::new(DisplayRow(1), 10),
-                    language::SelectionGoal::HorizontalPosition(x.0)
+                    language::SelectionGoal::HorizontalPosition(f64::from(x))
                 )
             );
             assert_eq!(
                 movement::down(
                     &snapshot,
                     DisplayPoint::new(DisplayRow(1), 10),
-                    language::SelectionGoal::HorizontalPosition(x.0),
+                    language::SelectionGoal::HorizontalPosition(f64::from(x)),
                     false,
                     &text_layout_details
                 ),
                 (
                     DisplayPoint::new(DisplayRow(2), 4),
-                    language::SelectionGoal::HorizontalPosition(x.0)
+                    language::SelectionGoal::HorizontalPosition(f64::from(x))
                 )
             );
 
-            let ix = snapshot.buffer_snapshot.text().find("seven").unwrap();
+            let ix = MultiBufferOffset(snapshot.buffer_snapshot().text().find("seven").unwrap());
             buffer.update(cx, |buffer, cx| {
                 buffer.edit([(ix..ix, "and ")], None, cx);
             });
@@ -1882,7 +2127,7 @@ pub mod tests {
 
             // Re-wrap on font size changes
             map.update(cx, |map, cx| {
-                map.set_font(font("Helvetica"), px(font_size.0 + 3.), cx)
+                map.set_font(font("Helvetica"), font_size + Pixels::from(3.), cx)
             });
 
             let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
@@ -1987,7 +2232,6 @@ pub mod tests {
                     style: BlockStyle::Sticky,
                     render: Arc::new(|_| div().into_any()),
                     priority: 0,
-                    render_in_minimap: true,
                 }],
                 cx,
             );
@@ -1997,11 +2241,11 @@ pub mod tests {
         map.update(cx, |map, cx| {
             map.splice_inlays(
                 &[],
-                vec![Inlay {
-                    id: InlayId::InlineCompletion(0),
-                    position: buffer_snapshot.anchor_after(0),
-                    text: "\n".into(),
-                }],
+                vec![Inlay::edit_prediction(
+                    0,
+                    buffer_snapshot.anchor_after(MultiBufferOffset(0)),
+                    "\n",
+                )],
                 cx,
             );
         });
@@ -2010,7 +2254,11 @@ pub mod tests {
         // Regression test: updating the display map does not crash when a
         // block is immediately followed by a multi-line inlay.
         buffer.update(cx, |buffer, cx| {
-            buffer.edit([(1..1, "b")], None, cx);
+            buffer.edit(
+                [(MultiBufferOffset(1)..MultiBufferOffset(1), "b")],
+                None,
+                cx,
+            );
         });
         map.update(cx, |m, cx| assert_eq!(m.snapshot(cx).text(), "\n\n\nab"));
     }
@@ -2049,7 +2297,11 @@ pub mod tests {
         );
         language.set_theme(&theme);
 
-        cx.update(|cx| init_test(cx, |s| s.defaults.tab_size = Some(2.try_into().unwrap())));
+        cx.update(|cx| {
+            init_test(cx, |s| {
+                s.project.all_languages.defaults.tab_size = Some(2.try_into().unwrap())
+            })
+        });
 
         let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(language, cx));
         cx.condition(&buffer, |buf, _| !buf.is_parsing()).await;
@@ -2185,7 +2437,6 @@ pub mod tests {
                         style: BlockStyle::Sticky,
                         render: Arc::new(|_| div().into_any()),
                         priority: 0,
-                        render_in_minimap: true,
                     },
                     BlockProperties {
                         placement: BlockPlacement::Below(
@@ -2195,7 +2446,6 @@ pub mod tests {
                         style: BlockStyle::Sticky,
                         render: Arc::new(|_| div().into_any()),
                         priority: 0,
-                        render_in_minimap: true,
                     },
                 ],
                 cx,
@@ -2284,7 +2534,7 @@ pub mod tests {
         // Insert a block in the middle of a multi-line diagnostic.
         map.update(cx, |map, cx| {
             map.highlight_text(
-                TypeId::of::<usize>(),
+                HighlightKey::Type(TypeId::of::<usize>()),
                 vec![
                     buffer_snapshot.anchor_before(Point::new(3, 9))
                         ..buffer_snapshot.anchor_after(Point::new(3, 14)),
@@ -2292,6 +2542,8 @@ pub mod tests {
                         ..buffer_snapshot.anchor_after(Point::new(3, 18)),
                 ],
                 red.into(),
+                false,
+                cx,
             );
             map.insert_blocks(
                 [BlockProperties {
@@ -2302,7 +2554,6 @@ pub mod tests {
                     style: BlockStyle::Sticky,
                     render: Arc::new(|_| div().into_any()),
                     priority: 0,
-                    render_in_minimap: true,
                 }],
                 cx,
             )
@@ -2315,11 +2566,12 @@ pub mod tests {
                 .highlight_style
                 .and_then(|style| style.color)
                 .map_or(black, |color| color.to_rgb());
-            if let Some((last_chunk, last_severity, last_color)) = chunks.last_mut() {
-                if *last_severity == chunk.diagnostic_severity && *last_color == color {
-                    last_chunk.push_str(chunk.text);
-                    continue;
-                }
+            if let Some((last_chunk, last_severity, last_color)) = chunks.last_mut()
+                && *last_severity == chunk.diagnostic_severity
+                && *last_color == color
+            {
+                last_chunk.push_str(chunk.text);
+                continue;
             }
 
             chunks.push((chunk.text.to_string(), chunk.diagnostic_severity, color));
@@ -2378,7 +2630,6 @@ pub mod tests {
                     style: BlockStyle::Fixed,
                     render: Arc::new(|_| div().into_any()),
                     priority: 0,
-                    render_in_minimap: true,
                 }],
                 cx,
             );
@@ -2512,7 +2763,9 @@ pub mod tests {
             cx.update(|cx| syntax_chunks(DisplayRow(0)..DisplayRow(5), &map, &theme, cx)),
             [
                 ("fn \n".to_string(), None),
-                ("oute\nr".to_string(), Some(Hsla::blue())),
+                ("oute".to_string(), Some(Hsla::blue())),
+                ("\n".to_string(), None),
+                ("r".to_string(), Some(Hsla::blue())),
                 ("() \n{}\n\n".to_string(), None),
             ]
         );
@@ -2535,8 +2788,11 @@ pub mod tests {
             [
                 ("out".to_string(), Some(Hsla::blue())),
                 ("⋯\n".to_string(), None),
-                ("  \nfn ".to_string(), Some(Hsla::red())),
-                ("i\n".to_string(), Some(Hsla::blue()))
+                ("  ".to_string(), Some(Hsla::red())),
+                ("\n".to_string(), None),
+                ("fn ".to_string(), Some(Hsla::red())),
+                ("i".to_string(), Some(Hsla::blue())),
+                ("\n".to_string(), None)
             ]
         );
     }
@@ -2569,7 +2825,7 @@ pub mod tests {
         );
         language.set_theme(&theme);
 
-        let (text, highlighted_ranges) = marked_text_ranges(r#"constˇ «a»: B = "c «d»""#, false);
+        let (text, highlighted_ranges) = marked_text_ranges(r#"constˇ «a»«:» B = "c «d»""#, false);
 
         let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(language, cx));
         cx.condition(&buffer, |buf, _| !buf.is_parsing()).await;
@@ -2599,17 +2855,20 @@ pub mod tests {
             ..Default::default()
         };
 
-        map.update(cx, |map, _cx| {
+        map.update(cx, |map, cx| {
             map.highlight_text(
-                TypeId::of::<MyType>(),
+                HighlightKey::Type(TypeId::of::<MyType>()),
                 highlighted_ranges
                     .into_iter()
+                    .map(|range| MultiBufferOffset(range.start)..MultiBufferOffset(range.end))
                     .map(|range| {
                         buffer_snapshot.anchor_before(range.start)
                             ..buffer_snapshot.anchor_before(range.end)
                     })
                     .collect(),
                 style,
+                false,
+                cx,
             );
         });
 
@@ -2618,7 +2877,7 @@ pub mod tests {
             [
                 ("const ".to_string(), None, None),
                 ("a".to_string(), None, Some(Hsla::blue())),
-                (":".to_string(), Some(Hsla::red()), None),
+                (":".to_string(), Some(Hsla::red()), Some(Hsla::blue())),
                 (" B = ".to_string(), None, None),
                 ("\"c ".to_string(), Some(Hsla::green()), None),
                 ("d".to_string(), Some(Hsla::green()), Some(Hsla::blue())),
@@ -2861,27 +3120,25 @@ pub mod tests {
                 .syntax_highlight_id
                 .and_then(|id| id.style(theme)?.color);
             let highlight_color = chunk.highlight_style.and_then(|style| style.color);
-            if let Some((last_chunk, last_syntax_color, last_highlight_color)) = chunks.last_mut() {
-                if syntax_color == *last_syntax_color && highlight_color == *last_highlight_color {
-                    last_chunk.push_str(chunk.text);
-                    continue;
-                }
+            if let Some((last_chunk, last_syntax_color, last_highlight_color)) = chunks.last_mut()
+                && syntax_color == *last_syntax_color
+                && highlight_color == *last_highlight_color
+            {
+                last_chunk.push_str(chunk.text);
+                continue;
             }
             chunks.push((chunk.text.to_string(), syntax_color, highlight_color));
         }
         chunks
     }
 
-    fn init_test(cx: &mut App, f: impl Fn(&mut AllLanguageSettingsContent)) {
+    fn init_test(cx: &mut App, f: impl Fn(&mut SettingsContent)) {
         let settings = SettingsStore::test(cx);
         cx.set_global(settings);
-        workspace::init_settings(cx);
-        language::init(cx);
         crate::init(cx);
-        Project::init_settings(cx);
         theme::init(LoadThemes::JustBase, cx);
         cx.update_global::<SettingsStore, _>(|store, cx| {
-            store.update_user_settings::<AllLanguageSettings>(cx, f);
+            store.update_user_settings(cx, f);
         });
     }
 }

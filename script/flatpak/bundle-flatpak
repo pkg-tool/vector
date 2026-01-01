@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 shopt -s extglob
 
-script/bundle-linux
-archive_match="vector(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
+script/bundle-linux --flatpak
+archive_match="zed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
 archive=$(ls "target/release" | grep -E ${archive_match})
 channel=$(<crates/vector/RELEASE_CHANNEL)
 

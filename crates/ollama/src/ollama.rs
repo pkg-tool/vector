@@ -1,61 +1,42 @@
 use anyhow::{Context as _, Result};
 use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::BoxStream};
-use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest, http};
+use http_client::{AsyncBody, HttpClient, HttpRequestExt, Method, Request as HttpRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+pub use settings::KeepAlive;
 
 pub const OLLAMA_API_URL: &str = "http://localhost:11434";
-
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
-#[serde(untagged)]
-pub enum KeepAlive {
-    /// Keep model alive for N seconds
-    Seconds(isize),
-    /// Keep model alive for a fixed duration. Accepts durations like "5m", "10m", "1h", "1d", etc.
-    Duration(String),
-}
-
-impl KeepAlive {
-    /// Keep model alive until a new model is loaded or until Ollama shuts down
-    fn indefinite() -> Self {
-        Self::Seconds(-1)
-    }
-}
-
-impl Default for KeepAlive {
-    fn default() -> Self {
-        Self::indefinite()
-    }
-}
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Model {
     pub name: String,
     pub display_name: Option<String>,
-    pub max_tokens: usize,
+    pub max_tokens: u64,
     pub keep_alive: Option<KeepAlive>,
     pub supports_tools: Option<bool>,
+    pub supports_vision: Option<bool>,
+    pub supports_thinking: Option<bool>,
 }
 
-fn get_max_tokens(name: &str) -> usize {
+fn get_max_tokens(name: &str) -> u64 {
     /// Default context length for unknown models.
-    const DEFAULT_TOKENS: usize = 4096;
+    const DEFAULT_TOKENS: u64 = 4096;
     /// Magic number. Lets many Ollama models work with ~16GB of ram.
-    const MAXIMUM_TOKENS: usize = 16384;
+    /// Models that support context beyond 16k such as codestral (32k) or devstral (128k) will be clamped down to 16k
+    const MAXIMUM_TOKENS: u64 = 16384;
 
     match name.split(':').next().unwrap() {
-        "phi" | "tinyllama" | "granite-code" => 2048,
-        "llama2" | "yi" | "vicuna" | "stablelm2" => 4096,
-        "llama3" | "gemma2" | "gemma" | "codegemma" | "starcoder" | "aya" => 8192,
+        "granite-code" | "phi" | "tinyllama" => 2048,
+        "llama2" | "stablelm2" | "vicuna" | "yi" => 4096,
+        "aya" | "codegemma" | "gemma" | "gemma2" | "llama3" | "starcoder" => 8192,
         "codellama" | "starcoder2" => 16384,
-        "mistral" | "codestral" | "mixstral" | "llava" | "qwen2" | "qwen2.5-coder"
-        | "dolphin-mixtral" => 32768,
-        "llama3.1" | "llama3.2" | "llama3.3" | "phi3" | "phi3.5" | "phi4" | "command-r"
-        | "qwen3" | "gemma3" | "deepseek-coder-v2" | "deepseek-v3" | "deepseek-r1" | "yi-coder"
-        | "devstral" => 128000,
+        "codestral" | "dolphin-mixtral" | "llava" | "magistral" | "mistral" | "mixstral"
+        | "qwen2" | "qwen2.5-coder" => 32768,
+        "cogito" | "command-r" | "deepseek-coder-v2" | "deepseek-r1" | "deepseek-v3"
+        | "devstral" | "gemma3" | "gpt-oss" | "granite3.3" | "llama3.1" | "llama3.2"
+        | "llama3.3" | "mistral-nemo" | "phi3" | "phi3.5" | "phi4" | "qwen3" | "yi-coder" => 128000,
+        "qwen3-coder" => 256000,
         _ => DEFAULT_TOKENS,
     }
     .clamp(1, MAXIMUM_TOKENS)
@@ -65,8 +46,10 @@ impl Model {
     pub fn new(
         name: &str,
         display_name: Option<&str>,
-        max_tokens: Option<usize>,
+        max_tokens: Option<u64>,
         supports_tools: Option<bool>,
+        supports_vision: Option<bool>,
+        supports_thinking: Option<bool>,
     ) -> Self {
         Self {
             name: name.to_owned(),
@@ -76,6 +59,8 @@ impl Model {
             max_tokens: max_tokens.unwrap_or_else(|| get_max_tokens(name)),
             keep_alive: Some(KeepAlive::indefinite()),
             supports_tools,
+            supports_vision,
+            supports_thinking,
         }
     }
 
@@ -87,7 +72,7 @@ impl Model {
         self.display_name.as_ref().unwrap_or(&self.name)
     }
 
-    pub fn max_token_count(&self) -> usize {
+    pub fn max_token_count(&self) -> u64 {
         self.max_tokens
     }
 }
@@ -98,19 +83,30 @@ pub enum ChatMessage {
     Assistant {
         content: String,
         tool_calls: Option<Vec<OllamaToolCall>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<String>>,
+        thinking: Option<String>,
     },
     User {
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<String>>,
     },
     System {
+        content: String,
+    },
+    Tool {
+        tool_name: String,
         content: String,
     },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
-pub enum OllamaToolCall {
-    Function(OllamaFunctionCall),
+pub struct OllamaToolCall {
+    // TODO: Remove `Option` after most users have updated to Ollama v0.12.10,
+    // which was released on the 4th of November 2025
+    pub id: Option<String>,
+    pub function: OllamaFunctionCall,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -140,20 +136,13 @@ pub struct ChatRequest {
     pub keep_alive: KeepAlive,
     pub options: Option<ChatOptions>,
     pub tools: Vec<OllamaTool>,
-}
-
-impl ChatRequest {
-    pub fn with_tools(mut self, tools: Vec<OllamaTool>) -> Self {
-        self.stream = false;
-        self.tools = tools;
-        self
-    }
+    pub think: Option<bool>,
 }
 
 // https://github.com/ollama/ollama/blob/main/docs/modelfile.md#valid-parameters-and-values
 #[derive(Serialize, Default, Debug)]
 pub struct ChatOptions {
-    pub num_ctx: Option<usize>,
+    pub num_ctx: Option<u64>,
     pub num_predict: Option<isize>,
     pub stop: Option<Vec<String>>,
     pub temperature: Option<f32>,
@@ -162,15 +151,13 @@ pub struct ChatOptions {
 
 #[derive(Deserialize, Debug)]
 pub struct ChatResponseDelta {
-    #[allow(unused)]
     pub model: String,
-    #[allow(unused)]
     pub created_at: String,
     pub message: ChatMessage,
-    #[allow(unused)]
     pub done_reason: Option<String>,
-    #[allow(unused)]
     pub done: bool,
+    pub prompt_eval_count: Option<u64>,
+    pub eval_count: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -204,10 +191,74 @@ pub struct ModelDetails {
     pub quantization_level: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Debug)]
 pub struct ModelShow {
-    #[serde(default)]
     pub capabilities: Vec<String>,
+    pub context_length: Option<u64>,
+    pub architecture: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ModelShow {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        struct ModelShowVisitor;
+
+        impl<'de> Visitor<'de> for ModelShowVisitor {
+            type Value = ModelShow;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a ModelShow object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut capabilities: Vec<String> = Vec::new();
+                let mut architecture: Option<String> = None;
+                let mut context_length: Option<u64> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "capabilities" => {
+                            capabilities = map.next_value()?;
+                        }
+                        "model_info" => {
+                            let model_info: Value = map.next_value()?;
+                            if let Value::Object(obj) = model_info {
+                                architecture = obj
+                                    .get("general.architecture")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
+
+                                if let Some(arch) = &architecture {
+                                    context_length = obj
+                                        .get(&format!("{}.context_length", arch))
+                                        .and_then(|v| v.as_u64());
+                                }
+                            }
+                        }
+                        _ => {
+                            let _: de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                Ok(ModelShow {
+                    capabilities,
+                    context_length,
+                    architecture,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ModelShowVisitor)
+    }
 }
 
 impl ModelShow {
@@ -215,52 +266,32 @@ impl ModelShow {
         // .contains expects &String, which would require an additional allocation
         self.capabilities.iter().any(|v| v == "tools")
     }
-}
 
-pub async fn complete(
-    client: &dyn HttpClient,
-    api_url: &str,
-    request: ChatRequest,
-) -> Result<ChatResponseDelta> {
-    let uri = format!("{api_url}/api/chat");
-    let request_builder = HttpRequest::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("Content-Type", "application/json");
+    pub fn supports_vision(&self) -> bool {
+        self.capabilities.iter().any(|v| v == "vision")
+    }
 
-    let serialized_request = serde_json::to_string(&request)?;
-    let request = request_builder.body(AsyncBody::from(serialized_request))?;
-
-    let mut response = client.send(request).await?;
-
-    let mut body = Vec::new();
-    response.body_mut().read_to_end(&mut body).await?;
-
-    if response.status().is_success() {
-        let response_message: ChatResponseDelta = serde_json::from_slice(&body)?;
-        Ok(response_message)
-    } else {
-        let body_str = std::str::from_utf8(&body)?;
-        anyhow::bail!(
-            "Failed to connect to API: {} {}",
-            response.status(),
-            body_str
-        );
+    pub fn supports_thinking(&self) -> bool {
+        self.capabilities.iter().any(|v| v == "thinking")
     }
 }
 
 pub async fn stream_chat_completion(
     client: &dyn HttpClient,
     api_url: &str,
+    api_key: Option<&str>,
     request: ChatRequest,
 ) -> Result<BoxStream<'static, Result<ChatResponseDelta>>> {
     let uri = format!("{api_url}/api/chat");
-    let request_builder = http::Request::builder()
+    let request = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)
-        .header("Content-Type", "application/json");
+        .header("Content-Type", "application/json")
+        .when_some(api_key, |builder, api_key| {
+            builder.header("Authorization", format!("Bearer {api_key}"))
+        })
+        .body(AsyncBody::from(serde_json::to_string(&request)?))?;
 
-    let request = request_builder.body(AsyncBody::from(serde_json::to_string(&request)?))?;
     let mut response = client.send(request).await?;
     if response.status().is_success() {
         let reader = BufReader::new(response.into_body());
@@ -286,15 +317,17 @@ pub async fn stream_chat_completion(
 pub async fn get_models(
     client: &dyn HttpClient,
     api_url: &str,
-    _: Option<Duration>,
+    api_key: Option<&str>,
 ) -> Result<Vec<LocalModelListing>> {
     let uri = format!("{api_url}/api/tags");
-    let request_builder = HttpRequest::builder()
+    let request = HttpRequest::builder()
         .method(Method::GET)
         .uri(uri)
-        .header("Accept", "application/json");
-
-    let request = request_builder.body(AsyncBody::default())?;
+        .header("Accept", "application/json")
+        .when_some(api_key, |builder, api_key| {
+            builder.header("Authorization", format!("Bearer {api_key}"))
+        })
+        .body(AsyncBody::default())?;
 
     let mut response = client.send(request).await?;
 
@@ -313,12 +346,20 @@ pub async fn get_models(
 }
 
 /// Fetch details of a model, used to determine model capabilities
-pub async fn show_model(client: &dyn HttpClient, api_url: &str, model: &str) -> Result<ModelShow> {
+pub async fn show_model(
+    client: &dyn HttpClient,
+    api_url: &str,
+    api_key: Option<&str>,
+    model: &str,
+) -> Result<ModelShow> {
     let uri = format!("{api_url}/api/show");
     let request = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)
         .header("Content-Type", "application/json")
+        .when_some(api_key, |builder, api_key| {
+            builder.header("Authorization", format!("Bearer {api_key}"))
+        })
         .body(AsyncBody::from(
             serde_json::json!({ "model": model }).to_string(),
         ))?;
@@ -335,36 +376,6 @@ pub async fn show_model(client: &dyn HttpClient, api_url: &str, model: &str) -> 
     );
     let details: ModelShow = serde_json::from_str(body.as_str())?;
     Ok(details)
-}
-
-/// Sends an empty request to Ollama to trigger loading the model
-pub async fn preload_model(client: Arc<dyn HttpClient>, api_url: &str, model: &str) -> Result<()> {
-    let uri = format!("{api_url}/api/generate");
-    let request = HttpRequest::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("Content-Type", "application/json")
-        .body(AsyncBody::from(
-            serde_json::json!({
-                "model": model,
-                "keep_alive": "15m",
-            })
-            .to_string(),
-        ))?;
-
-    let mut response = client.send(request).await?;
-
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        let mut body = String::new();
-        response.body_mut().read_to_string(&mut body).await?;
-        anyhow::bail!(
-            "Failed to connect to Ollama API: {} {}",
-            response.status(),
-            body,
-        );
-    }
 }
 
 #[cfg(test)]
@@ -435,6 +446,7 @@ mod tests {
                 "content": "",
                 "tool_calls": [
                     {
+                        "id": "call_llama3.2:3b_145155",
                         "function": {
                             "name": "weather",
                             "arguments": {
@@ -459,9 +471,62 @@ mod tests {
             ChatMessage::Assistant {
                 content,
                 tool_calls,
+                images: _,
+                thinking,
             } => {
                 assert!(content.is_empty());
                 assert!(tool_calls.is_some_and(|v| !v.is_empty()));
+                assert!(thinking.is_none());
+            }
+            _ => panic!("Deserialized wrong role"),
+        }
+    }
+
+    // Backwards compatibility with Ollama versions prior to v0.12.10 November 2025
+    // This test is a copy of `parse_tool_call()` with the `id` field omitted.
+    #[test]
+    fn parse_tool_call_pre_0_12_10() {
+        let response = serde_json::json!({
+            "model": "llama3.2:3b",
+            "created_at": "2025-04-28T20:02:02.140489Z",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "weather",
+                            "arguments": {
+                                "city": "london",
+                            }
+                        }
+                    }
+                ]
+            },
+            "done_reason": "stop",
+            "done": true,
+            "total_duration": 2758629166u64,
+            "load_duration": 1770059875,
+            "prompt_eval_count": 147,
+            "prompt_eval_duration": 684637583,
+            "eval_count": 16,
+            "eval_duration": 302561917,
+        });
+
+        let result: ChatResponseDelta = serde_json::from_value(response).unwrap();
+        match result.message {
+            ChatMessage::Assistant {
+                content,
+                tool_calls: Some(tool_calls),
+                images: _,
+                thinking,
+            } => {
+                assert!(content.is_empty());
+                assert!(thinking.is_none());
+
+                // When the `Option` around `id` is removed, this test should complain
+                // and be subsequently deleted in favor of `parse_tool_call()`
+                assert!(tool_calls.first().is_some_and(|call| call.id.is_none()))
             }
             _ => panic!("Deserialized wrong role"),
         }
@@ -522,5 +587,74 @@ mod tests {
         assert!(result.supports_tools());
         assert!(result.capabilities.contains(&"tools".to_string()));
         assert!(result.capabilities.contains(&"completion".to_string()));
+
+        assert_eq!(result.architecture, Some("llama".to_string()));
+        assert_eq!(result.context_length, Some(131072));
+    }
+
+    #[test]
+    fn serialize_chat_request_with_images() {
+        let base64_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+        let request = ChatRequest {
+            model: "llava".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "What do you see in this image?".to_string(),
+                images: Some(vec![base64_image.to_string()]),
+            }],
+            stream: false,
+            keep_alive: KeepAlive::default(),
+            options: None,
+            think: None,
+            tools: vec![],
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(serialized.contains("images"));
+        assert!(serialized.contains(base64_image));
+    }
+
+    #[test]
+    fn serialize_chat_request_without_images() {
+        let request = ChatRequest {
+            model: "llama3.2".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "Hello, world!".to_string(),
+                images: None,
+            }],
+            stream: false,
+            keep_alive: KeepAlive::default(),
+            options: None,
+            think: None,
+            tools: vec![],
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(!serialized.contains("images"));
+    }
+
+    #[test]
+    fn test_json_format_with_images() {
+        let base64_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+        let request = ChatRequest {
+            model: "llava".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "What do you see?".to_string(),
+                images: Some(vec![base64_image.to_string()]),
+            }],
+            stream: false,
+            keep_alive: KeepAlive::default(),
+            options: None,
+            think: None,
+            tools: vec![],
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        let message_images = parsed["messages"][0]["images"].as_array().unwrap();
+        assert_eq!(message_images.len(), 1);
+        assert_eq!(message_images[0].as_str().unwrap(), base64_image);
     }
 }

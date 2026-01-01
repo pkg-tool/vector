@@ -1,40 +1,25 @@
-//! Contains the [`VimModeSetting`] used to enable/disable Vim mode.
+//! Contains the [`VimModeSetting`] and [`HelixModeSetting`] used to enable/disable Vim and Helix modes.
 //!
 //! This is in its own crate as we want other crates to be able to enable or
-//! disable Vim mode without having to depend on the `vim` crate in its
+//! disable Vim/Helix modes without having to depend on the `vim` crate in its
 //! entirety.
 
-use anyhow::Result;
-use gpui::App;
-use settings::{Settings, SettingsSources};
+use settings::{RegisterSetting, Settings, SettingsContent};
 
-/// Initializes the `vim_mode_setting` crate.
-pub fn init(cx: &mut App) {
-    VimModeSetting::register(cx);
-}
-
-/// Whether or not to enable Vim mode.
-///
-/// Default: false
+#[derive(RegisterSetting)]
 pub struct VimModeSetting(pub bool);
 
 impl Settings for VimModeSetting {
-    const KEY: Option<&'static str> = Some("vim_mode");
-
-    type FileContent = Option<bool>;
-
-    fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> Result<Self> {
-        Ok(Self(
-            sources
-                .user
-                .or(sources.server)
-                .copied()
-                .flatten()
-                .unwrap_or(sources.default.ok_or_else(Self::missing_default)?),
-        ))
+    fn from_settings(content: &SettingsContent) -> Self {
+        Self(content.vim_mode.unwrap())
     }
+}
 
-    fn import_from_vscode(_vscode: &settings::VsCodeSettings, _current: &mut Self::FileContent) {
-        // TODO: could possibly check if any of the `vim.<foo>` keys are set?
+#[derive(RegisterSetting)]
+pub struct HelixModeSetting(pub bool);
+
+impl Settings for HelixModeSetting {
+    fn from_settings(content: &SettingsContent) -> Self {
+        Self(content.helix_mode.unwrap())
     }
 }

@@ -1,3 +1,4 @@
+mod capability_granter;
 pub mod extension_settings;
 pub mod wasm_host;
 
@@ -11,9 +12,9 @@ use extension::api::{ExtensionApiManifest, ExtensionMetadata, ExtensionProvides}
 use extension::extension_builder::{CompileExtensionOptions, ExtensionBuilder};
 use extension::{
     ExtensionContextServerProxy, ExtensionDebugAdapterProviderProxy, ExtensionEvents,
-    ExtensionGrammarProxy, ExtensionHostProxy, ExtensionIndexedDocsProviderProxy,
-    ExtensionLanguageProxy, ExtensionLanguageServerProxy, ExtensionSlashCommandProxy,
-    ExtensionSnippetProxy, ExtensionThemeProxy,
+    ExtensionGrammarProxy, ExtensionHostProxy, ExtensionLanguageProxy,
+    ExtensionLanguageServerProxy, ExtensionSlashCommandProxy, ExtensionSnippetProxy,
+    ExtensionThemeProxy,
 };
 use fs::{Fs, RemoveOptions};
 use futures::{
@@ -35,7 +36,7 @@ use language::{
 use node_runtime::NodeRuntime;
 use project::ContextProviderWithTasks;
 use release_channel::ReleaseChannel;
-use semantic_version::SemanticVersion;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use std::ops::RangeInclusive;
@@ -82,7 +83,7 @@ pub fn is_version_compatible(
         .manifest
         .wasm_api_version
         .as_ref()
-        .and_then(|wasm_api_version| SemanticVersion::from_str(wasm_api_version).ok())
+        .and_then(|wasm_api_version| Version::from_str(wasm_api_version).ok())
     {
         if !is_supported_wasm_api_version(release_channel, wasm_api_version) {
             return false;
@@ -529,11 +530,14 @@ impl ExtensionStore {
         if !manifest.slash_commands.is_empty() {
             provides.insert(ExtensionProvides::SlashCommands);
         }
-        if !manifest.indexed_docs_providers.is_empty() {
-            provides.insert(ExtensionProvides::IndexedDocsProviders);
+        if !manifest.agent_servers.is_empty() {
+            provides.insert(ExtensionProvides::AgentServers);
         }
         if manifest.snippets.is_some() {
             provides.insert(ExtensionProvides::Snippets);
+        }
+        if !manifest.debug_adapters.is_empty() || !manifest.debug_locators.is_empty() {
+            provides.insert(ExtensionProvides::DebugAdapters);
         }
 
         let wasm_api_version = manifest
@@ -640,12 +644,14 @@ impl ExtensionStore {
 
             cx.background_spawn({
                 let extension_source_path = extension_source_path.clone();
+                let fs = fs.clone();
                 async move {
                     builder
                         .compile_extension(
                             &extension_source_path,
                             &mut extension_manifest,
                             CompileExtensionOptions { release: false },
+                            fs,
                         )
                         .await
                 }
@@ -702,12 +708,13 @@ impl ExtensionStore {
 
         cx.notify();
         let compile = cx.background_spawn(async move {
-            let mut manifest = ExtensionManifest::load(fs, &path).await?;
+            let mut manifest = ExtensionManifest::load(fs.clone(), &path).await?;
             builder
                 .compile_extension(
                     &path,
                     &mut manifest,
                     CompileExtensionOptions { release: true },
+                    fs,
                 )
                 .await
         });
@@ -840,12 +847,22 @@ impl ExtensionStore {
             for (language_server_name, config) in extension.manifest.language_servers.iter() {
                 for language in config.languages() {
                     self.proxy
-                        .remove_language_server(&language, language_server_name);
+                        .remove_language_server(&language, language_server_name, cx)
+                        .detach_and_log_err(cx);
                 }
             }
 
             for (server_id, _) in extension.manifest.context_servers.iter() {
                 self.proxy.unregister_context_server(server_id.clone(), cx);
+            }
+
+            for (debug_adapter_name, _) in extension.manifest.debug_adapters.iter() {
+                self.proxy
+                    .unregister_debug_adapter(debug_adapter_name.clone());
+            }
+
+            for (locator_name, _) in extension.manifest.debug_locators.iter() {
+                self.proxy.unregister_debug_locator(locator_name.clone());
             }
         }
 
@@ -930,6 +947,7 @@ impl ExtensionStore {
                         queries,
                         context_provider,
                         toolchain_provider: None,
+                        manifest_name: None,
                     })
                 }),
             );
@@ -984,7 +1002,7 @@ impl ExtensionStore {
 
                 let extension_path = root_dir.join(extension.manifest.id.as_ref());
                 let wasm_extension = WasmExtension::load(
-                    extension_path,
+                    extension_path.as_path(),
                     &extension.manifest,
                     wasm_host.clone(),
                     &cx,
@@ -1037,14 +1055,20 @@ impl ExtensionStore {
                             .register_context_server(extension.clone(), id.clone(), cx);
                     }
 
-                    for (provider_id, _provider) in &manifest.indexed_docs_providers {
-                        this.proxy
-                            .register_indexed_docs_provider(extension.clone(), provider_id.clone());
+                    for (debug_adapter_name, meta) in &manifest.debug_adapters {
+                        let schema_path = root_dir.join(manifest.id.as_ref()).join(
+                            extension::build_debug_adapter_schema_path(debug_adapter_name, meta),
+                        );
+                        this.proxy.register_debug_adapter(
+                            extension.clone(),
+                            debug_adapter_name.clone(),
+                            schema_path.as_path(),
+                        );
                     }
 
-                    for debug_adapter in &manifest.debug_adapters {
+                    for (locator_name, _) in &manifest.debug_locators {
                         this.proxy
-                            .register_debug_adapter(extension.clone(), debug_adapter.clone());
+                            .register_debug_locator(extension.clone(), locator_name.clone());
                     }
                 }
 

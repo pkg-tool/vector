@@ -1,13 +1,14 @@
 # Installing Extensions
 
-You can search for extensions by launching the Vector Extension Gallery by pressing `cmd-shift-x` (macOS) or `ctrl-shift-x` (Linux), opening the command palette and selecting `vector: extensions` or by selecting "Vector > Extensions" from the menu bar.
+You can search for extensions by launching the Zed Extension Gallery by pressing {#kb zed::Extensions} , opening the command palette and selecting {#action zed::Extensions} or by selecting "Zed > Extensions" from the menu bar.
 
 Here you can view the extensions that you currently have installed or search and install new ones.
 
 ## Installation Location
 
-- On macOS, extensions are installed in `~/Library/Application Support/Vector/extensions`.
-- On Linux, they are installed in either `$XDG_DATA_HOME/vector/extensions` or `~/.local/share/vector/extensions`.
+- On macOS, extensions are installed in `~/Library/Application Support/Zed/extensions`.
+- On Linux, they are installed in either `$XDG_DATA_HOME/zed/extensions` or `~/.local/share/zed/extensions`.
+- On Windows, the directory is `%LOCALAPPDATA%\Zed\extensions`.
 
 This directory contains two subdirectories:
 

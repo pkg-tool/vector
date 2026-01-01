@@ -16,7 +16,7 @@ use ui::{KeyBinding, ListItem, ListItemSpacing, Tooltip, prelude::*, tooltip_con
 use util::{ResultExt, paths::PathExt};
 use workspace::{
     CloseIntent, HistoryManager, ModalView, SerializedWorkspaceLocation, WORKSPACE_DB,
-    Workspace, WorkspaceId,
+    PathList, Workspace, WorkspaceId,
 };
 use vector_actions::OpenRecent;
 
@@ -129,7 +129,7 @@ impl Render for RecentProjects {
 
 pub struct RecentProjectsDelegate {
     workspace: WeakEntity<Workspace>,
-    workspaces: Vec<(WorkspaceId, SerializedWorkspaceLocation)>,
+    workspaces: Vec<(WorkspaceId, SerializedWorkspaceLocation, PathList)>,
     selected_match_index: usize,
     matches: Vec<StringMatch>,
     render_paths: bool,
@@ -151,7 +151,10 @@ impl RecentProjectsDelegate {
         }
     }
 
-    pub fn set_workspaces(&mut self, workspaces: Vec<(WorkspaceId, SerializedWorkspaceLocation)>) {
+    pub fn set_workspaces(
+        &mut self,
+        workspaces: Vec<(WorkspaceId, SerializedWorkspaceLocation, PathList)>,
+    ) {
         self.workspaces = workspaces;
     }
 }
@@ -205,10 +208,10 @@ impl PickerDelegate for RecentProjectsDelegate {
             .workspaces
             .iter()
             .enumerate()
-            .filter(|(_, (id, _))| !self.is_current_workspace(*id, cx))
-            .map(|(id, (_, location))| {
-                let combined_string = location
-                    .sorted_paths()
+            .filter(|(_, (id, _, _))| !self.is_current_workspace(*id, cx))
+            .map(|(id, (_, _, paths))| {
+                let combined_string = paths
+                    .paths()
                     .iter()
                     .map(|path| path.compact().to_string_lossy().into_owned())
                     .collect::<Vec<_>>()
@@ -221,6 +224,7 @@ impl PickerDelegate for RecentProjectsDelegate {
             candidates.as_slice(),
             query,
             smart_case,
+            true,
             100,
             &Default::default(),
             cx.background_executor().clone(),
@@ -247,8 +251,10 @@ impl PickerDelegate for RecentProjectsDelegate {
             .get(self.selected_index())
             .zip(self.workspace.upgrade())
         {
-            let (candidate_workspace_id, candidate_workspace_location) =
+            let (candidate_workspace_id, _, candidate_workspace_paths) =
                 &self.workspaces[selected_match.candidate_id];
+            let candidate_workspace_id = *candidate_workspace_id;
+            let paths = candidate_workspace_paths.paths().to_vec();
             let replace_current_window = if self.create_new_window {
                 secondary
             } else {
@@ -256,39 +262,32 @@ impl PickerDelegate for RecentProjectsDelegate {
             };
             workspace
                 .update(cx, |workspace, cx| {
-                    if workspace.database_id() == Some(*candidate_workspace_id) {
+                    if workspace.database_id() == Some(candidate_workspace_id) {
                         Task::ready(Ok(()))
                     } else {
-                        match candidate_workspace_location {
-                            SerializedWorkspaceLocation::Local(paths, _) => {
-                                let paths = paths.paths().to_vec();
-                                if replace_current_window {
-                                    cx.spawn_in(window, async move |workspace, cx| {
-                                        let continue_replacing = workspace
-                                            .update_in(cx, |workspace, window, cx| {
-                                                workspace.prepare_to_close(
-                                                    CloseIntent::ReplaceWindow,
-                                                    window,
-                                                    cx,
-                                                )
-                                            })?
-                                            .await?;
-                                        if continue_replacing {
-                                            workspace
-                                                .update_in(cx, |workspace, window, cx| {
-                                                    workspace.open_workspace_for_paths(
-                                                        true, paths, window, cx,
-                                                    )
-                                                })?
-                                                .await
-                                        } else {
-                                            Ok(())
-                                        }
-                                    })
+                        if replace_current_window {
+                            cx.spawn_in(window, async move |workspace, cx| {
+                                let continue_replacing = workspace
+                                    .update_in(cx, |workspace, window, cx| {
+                                        workspace.prepare_to_close(
+                                            CloseIntent::ReplaceWindow,
+                                            window,
+                                            cx,
+                                        )
+                                    })?
+                                    .await?;
+                                if continue_replacing {
+                                    workspace
+                                        .update_in(cx, |workspace, window, cx| {
+                                            workspace.open_workspace_for_paths(true, paths, window, cx)
+                                        })?
+                                        .await
                                 } else {
-                                    workspace.open_workspace_for_paths(false, paths, window, cx)
+                                    Ok(())
                                 }
-                            }
+                            })
+                        } else {
+                            workspace.open_workspace_for_paths(false, paths, window, cx)
                         }
                     }
                 })
@@ -317,24 +316,25 @@ impl PickerDelegate for RecentProjectsDelegate {
     ) -> Option<Self::ListItem> {
         let hit = self.matches.get(ix)?;
 
-        let (_, location) = self.workspaces.get(hit.candidate_id)?;
+        let (_, _, paths) = self.workspaces.get(hit.candidate_id)?;
 
         let mut path_start_offset = 0;
 
-        let (match_labels, paths): (Vec<_>, Vec<_>) = location
-            .sorted_paths()
+        let (match_labels, paths): (Vec<_>, Vec<_>) = paths
+            .paths()
             .iter()
             .map(|p| p.compact())
             .map(|path| {
                 let highlighted_text =
                     highlights_for_path(path.as_ref(), &hit.positions, path_start_offset);
 
-                path_start_offset += highlighted_text.1.char_count;
+                path_start_offset += highlighted_text.1.text.len();
                 highlighted_text
             })
             .unzip();
 
         let highlighted_match = HighlightedMatchWithPaths {
+            prefix: None,
             match_label: HighlightedMatch::join(match_labels.into_iter().flatten(), ", "),
             paths,
         };
@@ -402,7 +402,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                 .border_color(cx.theme().colors().border_variant)
                 .child(
                     Button::new("local", "Open Local Folder")
-                        .key_binding(KeyBinding::for_action(&workspace::Open, window, cx))
+                        .key_binding(KeyBinding::for_action(&workspace::Open, cx))
                         .on_click(|_, window, cx| {
                             window.dispatch_action(workspace::Open.boxed_clone(), cx)
                         }),
@@ -419,14 +419,14 @@ fn highlights_for_path(
     path_start_offset: usize,
 ) -> (Option<HighlightedMatch>, HighlightedMatch) {
     let path_string = path.to_string_lossy();
-    let path_char_count = path_string.chars().count();
+    let path_byte_count = path_string.len();
     // Get the subset of match highlight positions that line up with the given path.
     // Also adjusts them to start at the path start
     let path_positions = match_positions
         .iter()
         .copied()
         .skip_while(|position| *position < path_start_offset)
-        .take_while(|position| *position < path_start_offset + path_char_count)
+        .take_while(|position| *position < path_start_offset + path_byte_count)
         .map(|position| position - path_start_offset)
         .collect::<Vec<_>>();
 
@@ -434,19 +434,18 @@ fn highlights_for_path(
     // again adjusted to the start of the file_name
     let file_name_text_and_positions = path.file_name().map(|file_name| {
         let text = file_name.to_string_lossy();
-        let char_count = text.chars().count();
-        let file_name_start = path_char_count - char_count;
+        let byte_count = text.len();
+        let file_name_start = path_byte_count.saturating_sub(byte_count);
         let highlight_positions = path_positions
             .iter()
             .copied()
             .skip_while(|position| *position < file_name_start)
-            .take_while(|position| *position < file_name_start + char_count)
+            .take_while(|position| *position < file_name_start + byte_count)
             .map(|position| position - file_name_start)
             .collect::<Vec<_>>();
         HighlightedMatch {
             text: text.to_string(),
             highlight_positions,
-            char_count,
             color: Color::Default,
         }
     });
@@ -456,7 +455,6 @@ fn highlights_for_path(
         HighlightedMatch {
             text: path_string.to_string(),
             highlight_positions: path_positions,
-            char_count: path_char_count,
             color: Color::Default,
         },
     )
@@ -469,7 +467,8 @@ impl RecentProjectsDelegate {
         cx: &mut Context<Picker<Self>>,
     ) {
         if let Some(selected_match) = self.matches.get(ix) {
-            let (workspace_id, _) = self.workspaces[selected_match.candidate_id];
+            let (workspace_id, _, _) = &self.workspaces[selected_match.candidate_id];
+            let workspace_id = *workspace_id;
             cx.spawn_in(window, async move |this, cx| {
                 let _ = WORKSPACE_DB.delete_workspace_by_id(workspace_id).await;
                 let workspaces = WORKSPACE_DB
@@ -515,10 +514,8 @@ struct MatchTooltip {
 }
 
 impl Render for MatchTooltip {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        tooltip_container(window, cx, |div, _, _| {
-            self.highlighted_location.render_paths_children(div)
-        })
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        tooltip_container(cx, |div, _| self.highlighted_location.render_paths_children(div))
     }
 }
 
@@ -608,7 +605,8 @@ mod tests {
                     }];
                     delegate.set_workspaces(vec![(
                         WorkspaceId::default(),
-                        SerializedWorkspaceLocation::from_local_paths(vec![path!("/test/path/")]),
+                        SerializedWorkspaceLocation::Local,
+                        PathList::new(&[path!("/test/path/")]),
                     )]);
                 });
             })

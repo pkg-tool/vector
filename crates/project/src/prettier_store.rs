@@ -2,6 +2,7 @@ use std::{
     ops::ControlFlow,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -15,14 +16,14 @@ use futures::{
 use gpui::{AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
 use language::{
     Buffer, LanguageRegistry, LocalFile,
-    language_settings::{Formatter, LanguageSettings, SelectedFormatter},
+    language_settings::{Formatter, LanguageSettings},
 };
 use lsp::{LanguageServer, LanguageServerId, LanguageServerName};
 use node_runtime::NodeRuntime;
 use paths::default_prettier_dir;
 use prettier::Prettier;
 use smol::stream::StreamExt;
-use util::{ResultExt, TryFutureExt};
+use util::{ResultExt, TryFutureExt, rel_path::RelPath};
 
 use crate::{
     File, PathChange, ProjectEntryId, Worktree, lsp_store::WorktreeId,
@@ -318,7 +319,9 @@ impl PrettierStore {
             })?;
             match installation_task {
                 ControlFlow::Continue(None) => {
-                    anyhow::bail!("Default prettier is not installed and cannot be started")
+                    anyhow::bail!(
+                        "Default prettier auto-install is disabled (offline mode). Install prettier manually or configure a different formatter."
+                    )
                 }
                 ControlFlow::Continue(Some(installation_task)) => {
                     log::info!("Waiting for default prettier to install");
@@ -441,12 +444,12 @@ impl PrettierStore {
     pub fn update_prettier_settings(
         &self,
         worktree: &Entity<Worktree>,
-        changes: &[(Arc<Path>, ProjectEntryId, PathChange)],
+        changes: &[(Arc<RelPath>, ProjectEntryId, PathChange)],
         cx: &mut Context<Self>,
     ) {
         let prettier_config_files = Prettier::CONFIG_FILE_NAMES
             .iter()
-            .map(Path::new)
+            .map(|name| RelPath::unix(name).unwrap())
             .collect::<HashSet<_>>();
 
         let prettier_config_file_changed = changes
@@ -455,7 +458,7 @@ impl PrettierStore {
             .filter(|(path, _, _)| {
                 !path
                     .components()
-                    .any(|component| component.as_os_str().to_string_lossy() == "node_modules")
+                    .any(|component| component == "node_modules")
             })
             .find(|(path, _, _)| prettier_config_files.contains(path.as_ref()));
         let current_worktree_id = worktree.read(cx).id();
@@ -511,9 +514,9 @@ impl PrettierStore {
 
     pub fn install_default_prettier(
         &mut self,
-        worktree: Option<WorktreeId>,
+        _worktree: Option<WorktreeId>,
         plugins: impl Iterator<Item = Arc<str>>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
         if cfg!(any(test, feature = "test-support")) {
             self.default_prettier.installed_plugins.extend(plugins);
@@ -524,141 +527,18 @@ impl PrettierStore {
             return;
         }
 
-        let mut new_plugins = plugins.collect::<HashSet<_>>();
-        let node = self.node.clone();
+        log::info!("Default prettier auto-install is disabled (offline mode).");
 
-        let fs = Arc::clone(&self.fs);
-        let locate_prettier_installation = match worktree.and_then(|worktree_id| {
-            self.worktree_store
-                .read(cx)
-                .worktree_for_id(worktree_id, cx)
-                .map(|worktree| worktree.read(cx).abs_path())
-        }) {
-            Some(locate_from) => {
-                let installed_prettiers = self.prettier_instances.keys().cloned().collect();
-                cx.background_spawn(async move {
-                    Prettier::locate_prettier_installation(
-                        fs.as_ref(),
-                        &installed_prettiers,
-                        locate_from.as_ref(),
-                    )
-                    .await
-                })
-            }
-            None => Task::ready(Ok(ControlFlow::Continue(None))),
-        };
-        new_plugins.retain(|plugin| !self.default_prettier.installed_plugins.contains(plugin));
-        let mut installation_attempt = 0;
-        let previous_installation_task = match &mut self.default_prettier.prettier {
-            PrettierInstallation::NotInstalled {
-                installation_task,
-                attempts,
-                not_installed_plugins,
-            } => {
-                installation_attempt = *attempts;
-                if installation_attempt > prettier::FAIL_THRESHOLD {
-                    *installation_task = None;
-                    log::warn!(
-                        "Default prettier installation had failed {installation_attempt} times, not attempting again",
-                    );
-                    return;
-                }
-                new_plugins.extend(not_installed_plugins.iter().cloned());
-                installation_task.clone()
-            }
-            PrettierInstallation::Installed { .. } => {
-                if new_plugins.is_empty() {
-                    return;
-                }
-                None
-            }
-        };
-
-        log::info!("Initializing default prettier with plugins {new_plugins:?}");
-        let plugins_to_install = new_plugins.clone();
-        let fs = Arc::clone(&self.fs);
-        let new_installation_task = cx
-            .spawn(async move  |project, cx| {
-                match locate_prettier_installation
-                    .await
-                    .context("locate prettier installation")
-                    .map_err(Arc::new)?
-                {
-                    ControlFlow::Break(()) => return Ok(()),
-                    ControlFlow::Continue(prettier_path) => {
-                        if prettier_path.is_some() {
-                            new_plugins.clear();
-                        }
-                        let mut needs_install = should_write_prettier_server_file(fs.as_ref()).await;
-                        if let Some(previous_installation_task) = previous_installation_task {
-                            if let Err(e) = previous_installation_task.await {
-                                log::error!("Failed to install default prettier: {e:#}");
-                                project.update(cx, |project, _| {
-                                    if let PrettierInstallation::NotInstalled { attempts, not_installed_plugins, .. } = &mut project.default_prettier.prettier {
-                                        *attempts += 1;
-                                        new_plugins.extend(not_installed_plugins.iter().cloned());
-                                        installation_attempt = *attempts;
-                                        needs_install = true;
-                                    };
-                                })?;
-                            }
-                        };
-                        if installation_attempt > prettier::FAIL_THRESHOLD {
-                            project.update(cx, |project, _| {
-                                if let PrettierInstallation::NotInstalled { installation_task, .. } = &mut project.default_prettier.prettier {
-                                    *installation_task = None;
-                                };
-                            })?;
-                            log::warn!(
-                                "Default prettier installation had failed {installation_attempt} times, not attempting again",
-                            );
-                            return Ok(());
-                        }
-                        project.update(cx, |project, _| {
-                            new_plugins.retain(|plugin| {
-                                !project.default_prettier.installed_plugins.contains(plugin)
-                            });
-                            if let PrettierInstallation::NotInstalled { not_installed_plugins, .. } = &mut project.default_prettier.prettier {
-                                not_installed_plugins.retain(|plugin| {
-                                    !project.default_prettier.installed_plugins.contains(plugin)
-                                });
-                                not_installed_plugins.extend(new_plugins.iter().cloned());
-                            }
-                            needs_install |= !new_plugins.is_empty();
-                        })?;
-                        if needs_install {
-                            let installed_plugins = new_plugins.clone();
-                            cx.background_spawn(async move {
-                                install_prettier_packages(fs.as_ref(), new_plugins, node).await?;
-                                // Save the server file last, so the reinstall need could be determined by the absence of the file.
-                                save_prettier_server_file(fs.as_ref()).await?;
-                                anyhow::Ok(())
-                            })
-                                .await
-                                .context("prettier & plugins install")
-                                .map_err(Arc::new)?;
-                            log::info!("Initialized prettier with plugins: {installed_plugins:?}");
-                            project.update(cx, |project, _| {
-                                project.default_prettier.prettier =
-                                    PrettierInstallation::Installed(PrettierInstance {
-                                        attempt: 0,
-                                        prettier: None,
-                                    });
-                                project.default_prettier
-                                    .installed_plugins
-                                    .extend(installed_plugins);
-                            })?;
-                        }
-                    }
-                }
-                Ok(())
-            })
-            .shared();
-        self.default_prettier.prettier = PrettierInstallation::NotInstalled {
-            attempts: installation_attempt,
-            installation_task: Some(new_installation_task),
-            not_installed_plugins: plugins_to_install,
-        };
+        let plugins = plugins.collect::<HashSet<_>>();
+        if let PrettierInstallation::NotInstalled {
+            installation_task,
+            not_installed_plugins,
+            ..
+        } = &mut self.default_prettier.prettier
+        {
+            *installation_task = None;
+            not_installed_plugins.extend(plugins);
+        }
     }
 
     pub fn on_settings_changed(
@@ -668,13 +548,13 @@ impl PrettierStore {
     ) {
         let mut prettier_plugins_by_worktree = HashMap::default();
         for (worktree, language_settings) in language_formatters_to_check {
-            if language_settings.prettier.allowed {
-                if let Some(plugins) = prettier_plugins_for_language(&language_settings) {
-                    prettier_plugins_by_worktree
-                        .entry(worktree)
-                        .or_insert_with(HashSet::default)
-                        .extend(plugins.iter().cloned());
-                }
+            if language_settings.prettier.allowed
+                && let Some(plugins) = prettier_plugins_for_language(&language_settings)
+            {
+                prettier_plugins_by_worktree
+                    .entry(worktree)
+                    .or_insert_with(HashSet::default)
+                    .extend(plugins.iter().cloned());
             }
         }
         for (worktree, prettier_plugins) in prettier_plugins_by_worktree {
@@ -690,14 +570,11 @@ impl PrettierStore {
 pub fn prettier_plugins_for_language(
     language_settings: &LanguageSettings,
 ) -> Option<&HashSet<String>> {
-    match &language_settings.formatter {
-        SelectedFormatter::Auto => Some(&language_settings.prettier.plugins),
-
-        SelectedFormatter::List(list) => list
-            .as_ref()
-            .contains(&Formatter::Prettier)
-            .then_some(&language_settings.prettier.plugins),
+    let formatters = language_settings.formatter.as_ref();
+    if formatters.contains(&Formatter::Prettier) || formatters.contains(&Formatter::Auto) {
+        return Some(&language_settings.prettier.plugins);
     }
+    None
 }
 
 pub(super) async fn format_with_prettier(
@@ -767,6 +644,7 @@ pub(super) async fn format_with_prettier(
     }
 }
 
+#[derive(Debug)]
 pub struct DefaultPrettier {
     prettier: PrettierInstallation,
     installed_plugins: HashSet<Arc<str>>,
@@ -897,7 +775,7 @@ async fn install_prettier_packages(
                     .with_context(|| {
                         format!("fetching latest npm version for package {returned_package_name}")
                     })?;
-                anyhow::Ok((returned_package_name, latest_version))
+                anyhow::Ok((returned_package_name, latest_version.to_string()))
             }),
     )
     .await

@@ -65,6 +65,7 @@ Here is the compatibility of the `vector_extension_api` with versions of Vector:
 
 | Vector version | `vector_extension_api` version |
 | ----------- | --------------------------- |
+| `0.192.x`   | `0.0.1` - `0.6.0`           |
 | `0.186.x`   | `0.0.1` - `0.5.0`           |
 | `0.184.x`   | `0.0.1` - `0.4.0`           |
 | `0.178.x`   | `0.0.1` - `0.3.0`           |

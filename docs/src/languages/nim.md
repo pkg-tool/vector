@@ -10,7 +10,7 @@ Report issues to: [https://github.com/foxoman/vector-nim/issues](https://github.
 
 To use [arnetheduck/nph](https://github.com/arnetheduck/nph) as a formatter, follow the [nph installation instructions](https://github.com/arnetheduck/nph?tab=readme-ov-file#installation) and add this to your Vector `settings.json`:
 
-```json
+```json [settings]
   "languages": {
     "Nim": {
       "formatter": {

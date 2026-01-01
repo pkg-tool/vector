@@ -38,8 +38,8 @@
       },
       "build-commands": [
         "install -Dm644 $ICON_FILE.png /app/share/icons/hicolor/512x512/apps/$APP_ID.png",
-        "envsubst < vector.desktop.in > vector.desktop && install -Dm644 vector.desktop /app/share/applications/$APP_ID.desktop",
-        "envsubst < flatpak/vector.metainfo.xml.in > vector.metainfo.xml && install -Dm644 vector.metainfo.xml /app/share/metainfo/$APP_ID.metainfo.xml",
+        "envsubst < zed.desktop.in > zed.desktop && install -Dm755 zed.desktop /app/share/applications/$APP_ID.desktop",
+        "envsubst < flatpak/zed.metainfo.xml.in > zed.metainfo.xml && install -Dm644 zed.metainfo.xml /app/share/metainfo/$APP_ID.metainfo.xml",
         "sed -i -e '/@release_info@/{r flatpak/release-info/$CHANNEL' -e 'd}' /app/share/metainfo/$APP_ID.metainfo.xml",
         "install -Dm755 bin/vector /app/bin/vector",
         "install -Dm755 libexec/vector-editor /app/libexec/vector-editor",

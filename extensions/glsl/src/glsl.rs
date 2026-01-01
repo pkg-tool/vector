@@ -16,10 +16,10 @@ impl GlslExtension {
             return Ok(path);
         }
 
-        if let Some(path) = &self.cached_binary_path {
-            if fs::metadata(path).map_or(false, |stat| stat.is_file()) {
-                return Ok(path.clone());
-            }
+        if let Some(path) = &self.cached_binary_path
+            && fs::metadata(path).is_ok_and(|stat| stat.is_file())
+        {
+            return Ok(path.clone());
         }
 
         vector::set_language_server_installation_status(
@@ -60,8 +60,8 @@ impl GlslExtension {
             .map_err(|err| format!("failed to create directory '{version_dir}': {err}"))?;
         let binary_path = format!("{version_dir}/bin/glsl_analyzer");
 
-        if !fs::metadata(&binary_path).map_or(false, |stat| stat.is_file()) {
-            vector::set_language_server_installation_status(
+        if !fs::metadata(&binary_path).is_ok_and(|stat| stat.is_file()) {
+            zed::set_language_server_installation_status(
                 language_server_id,
                 &vector::LanguageServerInstallationStatus::Downloading,
             );
@@ -119,7 +119,7 @@ impl vector::Extension for GlslExtension {
     ) -> Result<Option<serde_json::Value>> {
         let settings = LspSettings::for_worktree("glsl_analyzer", worktree)
             .ok()
-            .and_then(|lsp_settings| lsp_settings.settings.clone())
+            .and_then(|lsp_settings| lsp_settings.settings)
             .unwrap_or_default();
 
         Ok(Some(serde_json::json!({

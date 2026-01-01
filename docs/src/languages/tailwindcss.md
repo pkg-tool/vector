@@ -4,17 +4,12 @@ Vector has built-in support for Tailwind CSS autocomplete, linting, and hover pr
 
 - Language Server: [tailwindlabs/tailwindcss-intellisense](https://github.com/tailwindlabs/tailwindcss-intellisense)
 
-## Configuration
-
-<!--
-TBD: Document Tailwind CSS Configuration
--->
-
-Languages which can be used with Tailwind CSS in Vector:
+Languages which can be used with Tailwind CSS in Zed:
 
 - [Astro](./astro.md)
 - [CSS](./css.md)
 - [ERB](./ruby.md)
+- [Gleam](./gleam.md)
 - [HEEx](./elixir.md#heex)
 - [HTML](./html.md)
 - [TypeScript](./typescript.md)
@@ -23,11 +18,32 @@ Languages which can be used with Tailwind CSS in Vector:
 - [Svelte](./svelte.md)
 - [Vue](./vue.md)
 
+## Configuration
+
+If by default the language server isn't enough to make Tailwind work for a given language, you can configure the language server settings and add them to the `lsp` section of your `settings.json`:
+
+```json [settings]
+{
+  "lsp": {
+    "tailwindcss-language-server": {
+      "settings": {
+        "classFunctions": ["cva", "cx"],
+        "experimental": {
+          "classRegex": ["[cls|className]\\s\\:\\=\\s\"([^\"]*)"]
+        }
+      }
+    }
+  }
+}
+```
+
+Refer to [the Tailwind CSS language server settings docs](https://github.com/tailwindlabs/tailwindcss-intellisense?tab=readme-ov-file#extension-settings) for more information.
+
 ### Prettier Plugin
 
 Vector supports Prettier out of the box, which means that if you have the [Tailwind CSS Prettier plugin](https://github.com/tailwindlabs/prettier-plugin-tailwindcss) installed, adding it to your Prettier configuration will make it work automatically:
 
-```json
+```json [settings]
 // .prettierrc
 {
   "plugins": ["prettier-plugin-tailwindcss"]

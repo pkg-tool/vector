@@ -1,33 +1,19 @@
 # Getting Started
 
-Welcome to Vector! Here is a jumping-off point to getting started.
+Welcome to Zed! We are excited to have you. Zed is a powerful multiplayer code editor designed to stay out of your way and help you build what's next.
 
-## Install Vector
+## Key Features
 
-Vector can be built from source. See [Developing Vector](./development.md) for platform-specific build instructions.
+- [Smooth Editing](./configuring-zed.md): Built in Rust, Zed is responsive and intuitive, with a minimalistic aesthetic and pixel-level editing controls.
+- [Agentic Editing](./ai/overview.md): Use Zed's hosted models to collaborate with agents directly in an IDE. You can also plug into a third-party agent or bring your own keys.
+- [Debugger](./debugger.md): Debug your code in seconds, not hours, with minimal setup required.
+- [Remote Development](./remote-development.md): Offload the heavy lifting to the cloud, so you can focus on writing code.
+- [Extensions](./extensions.md): Leverage Zed's extensions to customize how you work.
 
-## Command Palette
+## Join the Zed Community
 
-The Command Palette is the main way to access pretty much any functionality that's available in Vector. Its keybinding is the first one you should make yourself familiar with. To open it, hit: {#kb command_palette::Toggle}.
+Zed is proudly open source, and we get better with every contribution. Join us on GitHub or in Discord to contribute code, report bugs, or suggest features.
 
-Try it! Open the Command Palette and type in `new file`. You should see the list of commands being filtered down to `workspace: new file`. Hit return and you end up with a new buffer.
-
-Any time you see instructions that include commands of the form `vector: ...` or `editor: ...` and so on that means you need to execute them in the Command Palette.
-
-## Configure Vector
-
-To open your custom settings to set things like fonts, formatting settings, per-language settings, and more, use the {#kb vector::OpenSettings} keybinding.
-
-To see all available settings, open the Command Palette with {#kb command_palette::Toggle} and search for `vector: open default settings`.
-You can also check them all out in the [Configuring Vector](./configuring-vector.md) documentation.
-
-## Configure AI in Vector
-
-Vector integrates LLMs in multiple ways across the editor.
-Visit [the AI overview page](./ai/overview.md) to learn how to quickly get started with LLMs on Vector.
-
-## Set up your key bindings
-
-To open your custom keymap to add your key bindings, use the {#kb vector::OpenKeymap} keybinding.
-
-To access the default key binding set, open the Command Palette with {#kb command_palette::Toggle} and search for "vector: open default keymap". See [Key Bindings](./key-bindings.md) for more info.
+- [Join Discord](https://discord.com/invite/zedindustries)
+- [GitHub Discussions](https://github.com/zed-industries/zed/discussions)
+- [Zed Reddit](https://www.reddit.com/r/ZedEditor)

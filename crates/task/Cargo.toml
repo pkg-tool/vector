@@ -11,6 +11,10 @@ test-support = [
     "util/test-support"
 ]
 
+[lib]
+path = "src/task.rs"
+doctest = false
+
 [lints]
 workspace = true
 
@@ -29,7 +33,6 @@ serde_json_lenient.workspace = true
 sha2.workspace = true
 shellexpand.workspace = true
 util.workspace = true
-workspace-hack.workspace = true
 vector_actions.workspace = true
 
 [dev-dependencies]

@@ -23,7 +23,7 @@ Vector support for Elm requires installation of `elm`, `elm-format`, and `elm-re
 
 Elm language server can be configured in your `settings.json`, e.g.:
 
-```json
+```json [settings]
 {
   "lsp": {
     "elm-language-server": {

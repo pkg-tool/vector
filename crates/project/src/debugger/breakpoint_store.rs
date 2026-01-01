@@ -19,7 +19,7 @@ use super::session::ThreadId;
 
 mod breakpoints_in_file {
     use collections::HashMap;
-    use language::{BufferEvent, DiskState};
+    use language::BufferEvent;
 
     use super::*;
 
@@ -78,7 +78,7 @@ mod breakpoints_in_file {
                     BufferEvent::FileHandleChanged => {
                         let entity_id = buffer.entity_id();
 
-                        if buffer.read(cx).file().is_none_or(|f| f.disk_state() == DiskState::Deleted) {
+                        if buffer.read(cx).file().is_none_or(|f| f.disk_state().is_deleted()) {
                             breakpoint_store.breakpoints.retain(|_, breakpoints_in_file| {
                                 breakpoints_in_file.buffer.entity_id() != entity_id
                             });
@@ -144,8 +144,155 @@ impl BreakpointStore {
         BreakpointStore {
             breakpoints: BTreeMap::new(),
             active_stack_frame: Default::default(),
-            worktree_store,
-            buffer_store,
+        }
+    }
+
+    pub(crate) fn remote(upstream_project_id: u64, upstream_client: AnyProtoClient) -> Self {
+        BreakpointStore {
+            breakpoints: BTreeMap::new(),
+            mode: BreakpointStoreMode::Remote(RemoteBreakpointStore {
+                upstream_client,
+                _upstream_project_id: upstream_project_id,
+            }),
+            downstream_client: None,
+            active_stack_frame: Default::default(),
+        }
+    }
+
+    pub(crate) fn shared(&mut self, project_id: u64, downstream_client: AnyProtoClient) {
+        self.downstream_client = Some((downstream_client, project_id));
+    }
+
+    pub(crate) fn unshared(&mut self, cx: &mut Context<Self>) {
+        self.downstream_client.take();
+
+        cx.notify();
+    }
+
+    async fn handle_breakpoints_for_file(
+        this: Entity<Project>,
+        message: TypedEnvelope<proto::BreakpointsForFile>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        let breakpoints = cx.update(|cx| this.read(cx).breakpoint_store())?;
+        if message.payload.breakpoints.is_empty() {
+            return Ok(());
+        }
+
+        let buffer = this
+            .update(&mut cx, |this, cx| {
+                let path =
+                    this.project_path_for_absolute_path(message.payload.path.as_ref(), cx)?;
+                Some(this.open_buffer(path, cx))
+            })
+            .ok()
+            .flatten()
+            .context("Invalid project path")?
+            .await?;
+
+        breakpoints.update(&mut cx, move |this, cx| {
+            let bps = this
+                .breakpoints
+                .entry(Arc::<Path>::from(message.payload.path.as_ref()))
+                .or_insert_with(|| BreakpointsInFile::new(buffer, cx));
+
+            bps.breakpoints = message
+                .payload
+                .breakpoints
+                .into_iter()
+                .filter_map(|breakpoint| {
+                    let position =
+                        language::proto::deserialize_anchor(breakpoint.position.clone()?)?;
+                    let session_state = breakpoint
+                        .session_state
+                        .iter()
+                        .map(|(session_id, state)| {
+                            let state = BreakpointSessionState {
+                                id: state.id,
+                                verified: state.verified,
+                            };
+                            (SessionId::from_proto(*session_id), state)
+                        })
+                        .collect();
+                    let breakpoint = Breakpoint::from_proto(breakpoint)?;
+                    let bp = BreakpointWithPosition {
+                        position,
+                        bp: breakpoint,
+                    };
+
+                    Some(StatefulBreakpoint { bp, session_state })
+                })
+                .collect();
+
+            cx.notify();
+        })?;
+
+        Ok(())
+    }
+
+    async fn handle_toggle_breakpoint(
+        this: Entity<Project>,
+        message: TypedEnvelope<proto::ToggleBreakpoint>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let breakpoints = this.read_with(&cx, |this, _| this.breakpoint_store())?;
+        let path = this
+            .update(&mut cx, |this, cx| {
+                this.project_path_for_absolute_path(message.payload.path.as_ref(), cx)
+            })?
+            .context("Could not resolve provided abs path")?;
+        let buffer = this
+            .update(&mut cx, |this, cx| {
+                this.buffer_store().read(cx).get_by_path(&path)
+            })?
+            .context("Could not find buffer for a given path")?;
+        let breakpoint = message
+            .payload
+            .breakpoint
+            .context("Breakpoint not present in RPC payload")?;
+        let position = language::proto::deserialize_anchor(
+            breakpoint
+                .position
+                .clone()
+                .context("Anchor not present in RPC payload")?,
+        )
+        .context("Anchor deserialization failed")?;
+        let breakpoint =
+            Breakpoint::from_proto(breakpoint).context("Could not deserialize breakpoint")?;
+
+        breakpoints.update(&mut cx, |this, cx| {
+            this.toggle_breakpoint(
+                buffer,
+                BreakpointWithPosition {
+                    position,
+                    bp: breakpoint,
+                },
+                BreakpointEditAction::Toggle,
+                cx,
+            );
+        })?;
+        Ok(proto::Ack {})
+    }
+
+    pub(crate) fn broadcast(&self) {
+        if let Some((client, project_id)) = &self.downstream_client {
+            for (path, breakpoint_set) in &self.breakpoints {
+                let _ = client.send(proto::BreakpointsForFile {
+                    project_id: *project_id,
+                    path: path.to_str().map(ToOwned::to_owned).unwrap(),
+                    breakpoints: breakpoint_set
+                        .breakpoints
+                        .iter()
+                        .filter_map(|breakpoint| {
+                            breakpoint.bp.bp.to_proto(
+                                path,
+                                breakpoint.position(),
+                                &breakpoint.session_state,
+                            )
+                        })
+                        .collect(),
+                });
+            }
         }
     }
 
@@ -208,7 +355,7 @@ impl BreakpointStore {
 
     pub fn abs_path_from_buffer(buffer: &Entity<Buffer>, cx: &App) -> Option<Arc<Path>> {
         worktree::File::from_dyn(buffer.read(cx).file())
-            .and_then(|file| file.worktree.read(cx).absolutize(&file.path).ok())
+            .map(|file| file.worktree.read(cx).absolutize(&file.path))
             .map(Arc::<Path>::from)
     }
 
@@ -271,9 +418,9 @@ impl BreakpointStore {
                     });
 
                     if let Some(found_bp) = found_bp {
-                        found_bp.message = Some(log_message.clone());
+                        found_bp.message = Some(log_message);
                     } else {
-                        breakpoint.bp.message = Some(log_message.clone());
+                        breakpoint.bp.message = Some(log_message);
                         // We did not remove any breakpoint, hence let's toggle one.
                         breakpoint_set
                             .breakpoints
@@ -303,9 +450,9 @@ impl BreakpointStore {
                     });
 
                     if let Some(found_bp) = found_bp {
-                        found_bp.hit_condition = Some(hit_condition.clone());
+                        found_bp.hit_condition = Some(hit_condition);
                     } else {
-                        breakpoint.bp.hit_condition = Some(hit_condition.clone());
+                        breakpoint.bp.hit_condition = Some(hit_condition);
                         // We did not remove any breakpoint, hence let's toggle one.
                         breakpoint_set
                             .breakpoints
@@ -335,9 +482,9 @@ impl BreakpointStore {
                     });
 
                     if let Some(found_bp) = found_bp {
-                        found_bp.condition = Some(condition.clone());
+                        found_bp.condition = Some(condition);
                     } else {
-                        breakpoint.bp.condition = Some(condition.clone());
+                        breakpoint.bp.condition = Some(condition);
                         // We did not remove any breakpoint, hence let's toggle one.
                         breakpoint_set
                             .breakpoints
@@ -376,7 +523,7 @@ impl BreakpointStore {
         cx: &mut Context<Self>,
     ) {
         if let Some(breakpoints) = self.breakpoints.remove(&old_path) {
-            self.breakpoints.insert(new_path.clone(), breakpoints);
+            self.breakpoints.insert(new_path, breakpoints);
 
             cx.notify();
         }
@@ -408,12 +555,11 @@ impl BreakpointStore {
                 file_breakpoints.breakpoints.iter().filter_map({
                     let range = range.clone();
                     move |bp| {
-                        if let Some(range) = &range {
-                            if bp.position().cmp(&range.start, buffer_snapshot).is_lt()
-                                || bp.position().cmp(&range.end, buffer_snapshot).is_gt()
-                            {
-                                return None;
-                            }
+                        if let Some(range) = &range
+                            && (bp.position().cmp(&range.start, buffer_snapshot).is_lt()
+                                || bp.position().cmp(&range.end, buffer_snapshot).is_gt())
+                        {
+                            return None;
                         }
                         let session_state = active_session_id
                             .and_then(|id| bp.session_state.get(&id))
@@ -450,6 +596,7 @@ impl BreakpointStore {
             .as_ref()
             .is_some_and(|active_position| active_position == &position)
         {
+            cx.emit(BreakpointStoreEvent::SetDebugLine);
             return;
         }
 
@@ -537,7 +684,7 @@ impl BreakpointStore {
                         .iter()
                         .map(|breakpoint| {
                             let position = snapshot
-                                .summary_for_anchor::<PointUtf16>(&breakpoint.position())
+                                .summary_for_anchor::<PointUtf16>(breakpoint.position())
                                 .row;
                             let breakpoint = &breakpoint.bp;
                             SourceBreakpoint {
@@ -560,8 +707,35 @@ impl BreakpointStore {
         breakpoints: BTreeMap<Arc<Path>, Vec<SourceBreakpoint>>,
         cx: &mut Context<BreakpointStore>,
     ) -> Task<Result<()>> {
-        let worktree_store = self.worktree_store.clone();
-        let buffer_store = self.buffer_store.clone();
+        if let BreakpointStoreMode::Local(mode) = &self.mode {
+            let mode = mode.clone();
+            cx.spawn(async move |this, cx| {
+                let mut new_breakpoints = BTreeMap::default();
+                for (path, bps) in breakpoints {
+                    if bps.is_empty() {
+                        continue;
+                    }
+                    let (worktree, relative_path) = mode
+                        .worktree_store
+                        .update(cx, |this, cx| {
+                            this.find_or_create_worktree(&path, false, cx)
+                        })?
+                        .await?;
+                    let buffer = mode
+                        .buffer_store
+                        .update(cx, |this, cx| {
+                            let path = ProjectPath {
+                                worktree_id: worktree.read(cx).id(),
+                                path: relative_path,
+                            };
+                            this.open_buffer(path, cx)
+                        })?
+                        .await;
+                    let Ok(buffer) = buffer else {
+                        log::error!("Todo: Serialized breakpoints which do not have buffer (yet)");
+                        continue;
+                    };
+                    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot())?;
 
         cx.spawn(async move |this, cx| {
             let mut new_breakpoints = BTreeMap::default();
@@ -569,35 +743,16 @@ impl BreakpointStore {
                 if bps.is_empty() {
                     continue;
                 }
-
-                let (worktree, relative_path) = worktree_store
-                    .update(cx, |this, cx| this.find_or_create_worktree(&path, false, cx))?
-                    .await?;
-                let buffer = buffer_store
-                    .update(cx, |this, cx| {
-                        let path = ProjectPath {
-                            worktree_id: worktree.read(cx).id(),
-                            path: relative_path.into(),
+                this.update(cx, |this, cx| {
+                    for (path, count) in new_breakpoints.iter().map(|(path, bp_in_file)| {
+                        (path.to_string_lossy(), bp_in_file.breakpoints.len())
+                    }) {
+                        let breakpoint_str = if count > 1 {
+                            "breakpoints"
+                        } else {
+                            "breakpoint"
                         };
-                        this.open_buffer(path, cx)
-                    })?
-                    .await;
-
-                let Ok(buffer) = buffer else {
-                    log::error!("Todo: Serialized breakpoints which do not have buffer (yet)");
-                    continue;
-                };
-                let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot())?;
-
-                let mut breakpoints_for_file =
-                    this.update(cx, |_, cx| BreakpointsInFile::new(buffer, cx))?;
-
-                for bp in bps {
-                    let max_point = snapshot.max_point_utf16();
-                    let point = PointUtf16::new(bp.row, 0);
-                    if point > max_point {
-                        log::error!("skipping a deserialized breakpoint that's out of range");
-                        continue;
+                        log::debug!("Deserialized {count} {breakpoint_str} at path: {path}");
                     }
                     let position = snapshot.anchor_after(point);
                     breakpoints_for_file
@@ -686,7 +841,7 @@ impl BreakpointState {
     }
 
     #[inline]
-    pub fn to_int(&self) -> i32 {
+    pub fn to_int(self) -> i32 {
         match self {
             BreakpointState::Enabled => 0,
             BreakpointState::Disabled => 1,
@@ -729,6 +884,51 @@ impl Breakpoint {
             condition: None,
             message: Some(log_message.into()),
         }
+    }
+
+    fn to_proto(
+        &self,
+        _path: &Path,
+        position: &text::Anchor,
+        session_states: &HashMap<SessionId, BreakpointSessionState>,
+    ) -> Option<proto::Breakpoint> {
+        Some(proto::Breakpoint {
+            position: Some(serialize_text_anchor(position)),
+            state: match self.state {
+                BreakpointState::Enabled => proto::BreakpointState::Enabled.into(),
+                BreakpointState::Disabled => proto::BreakpointState::Disabled.into(),
+            },
+            message: self.message.as_ref().map(|s| String::from(s.as_ref())),
+            condition: self.condition.as_ref().map(|s| String::from(s.as_ref())),
+            hit_condition: self
+                .hit_condition
+                .as_ref()
+                .map(|s| String::from(s.as_ref())),
+            session_state: session_states
+                .iter()
+                .map(|(session_id, state)| {
+                    (
+                        session_id.to_proto(),
+                        proto::BreakpointSessionState {
+                            id: state.id,
+                            verified: state.verified,
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    fn from_proto(breakpoint: proto::Breakpoint) -> Option<Self> {
+        Some(Self {
+            state: match proto::BreakpointState::from_i32(breakpoint.state) {
+                Some(proto::BreakpointState::Disabled) => BreakpointState::Disabled,
+                None | Some(proto::BreakpointState::Enabled) => BreakpointState::Enabled,
+            },
+            message: breakpoint.message.map(Into::into),
+            condition: breakpoint.condition.map(Into::into),
+            hit_condition: breakpoint.hit_condition.map(Into::into),
+        })
     }
 
     #[inline]

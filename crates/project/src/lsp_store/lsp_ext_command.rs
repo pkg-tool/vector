@@ -1,6 +1,10 @@
 use crate::{
     LocationLink,
-    lsp_command::{LspCommand, location_link_from_lsp, location_links_from_lsp},
+    lsp_command::{
+        LspCommand, file_path_to_lsp_url, location_link_from_lsp, location_link_from_proto,
+        location_link_to_proto, location_links_from_lsp, location_links_from_proto,
+        location_links_to_proto,
+    },
     lsp_store::LspStore,
     make_lsp_text_document_position, make_text_document_identifier,
 };
@@ -8,8 +12,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use collections::HashMap;
 use gpui::{App, AsyncApp, Entity};
-use language::{Buffer, point_to_lsp};
-use lsp::{LanguageServer, LanguageServerId};
+use language::{
+    Buffer, point_to_lsp,
+    proto::{deserialize_anchor, serialize_anchor},
+};
+use lsp::{AdapterServerCapabilities, LanguageServer, LanguageServerId};
+use rpc::proto::{self, PeerId};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -59,6 +67,10 @@ impl LspCommand for ExpandMacro {
         "Expand macro"
     }
 
+    fn check_capabilities(&self, _: AdapterServerCapabilities) -> bool {
+        true
+    }
+
     fn to_lsp(
         &self,
         path: &Path,
@@ -86,6 +98,61 @@ impl LspCommand for ExpandMacro {
                 expansion: message.expansion,
             })
             .unwrap_or_default())
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::LspExtExpandMacro {
+        proto::LspExtExpandMacro {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+        }
+    }
+
+    async fn from_proto(
+        message: Self::ProtoRequest,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        cx: AsyncApp,
+    ) -> anyhow::Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: ExpandedMacro,
+        _: &mut LspStore,
+        _: PeerId,
+        _: &clock::Global,
+        _: &mut App,
+    ) -> proto::LspExtExpandMacroResponse {
+        proto::LspExtExpandMacroResponse {
+            name: response.name,
+            expansion: response.expansion,
+        }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::LspExtExpandMacroResponse,
+        _: Entity<LspStore>,
+        _: Entity<Buffer>,
+        _: AsyncApp,
+    ) -> anyhow::Result<ExpandedMacro> {
+        Ok(ExpandedMacro {
+            name: message.name,
+            expansion: message.expansion,
+        })
+    }
+
+    fn buffer_id_from_proto(message: &proto::LspExtExpandMacro) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
     }
 }
 
@@ -131,6 +198,10 @@ impl LspCommand for OpenDocs {
         "Open docs"
     }
 
+    fn check_capabilities(&self, _: AdapterServerCapabilities) -> bool {
+        true
+    }
+
     fn to_lsp(
         &self,
         path: &Path,
@@ -140,7 +211,7 @@ impl LspCommand for OpenDocs {
     ) -> Result<OpenDocsParams> {
         Ok(OpenDocsParams {
             text_document: lsp::TextDocumentIdentifier {
-                uri: lsp::url_from_file_path(path).unwrap(),
+                uri: lsp::Uri::from_file_path(path).unwrap(),
             },
             position: point_to_lsp(self.position),
         })
@@ -160,6 +231,61 @@ impl LspCommand for OpenDocs {
                 local: message.local,
             })
             .unwrap_or_default())
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::LspExtOpenDocs {
+        proto::LspExtOpenDocs {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+        }
+    }
+
+    async fn from_proto(
+        message: Self::ProtoRequest,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        cx: AsyncApp,
+    ) -> anyhow::Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: DocsUrls,
+        _: &mut LspStore,
+        _: PeerId,
+        _: &clock::Global,
+        _: &mut App,
+    ) -> proto::LspExtOpenDocsResponse {
+        proto::LspExtOpenDocsResponse {
+            web: response.web,
+            local: response.local,
+        }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::LspExtOpenDocsResponse,
+        _: Entity<LspStore>,
+        _: Entity<Buffer>,
+        _: AsyncApp,
+    ) -> anyhow::Result<DocsUrls> {
+        Ok(DocsUrls {
+            web: message.web,
+            local: message.local,
+        })
+    }
+
+    fn buffer_id_from_proto(message: &proto::LspExtOpenDocs) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
     }
 }
 
@@ -205,6 +331,10 @@ impl LspCommand for SwitchSourceHeader {
         "Switch source header"
     }
 
+    fn check_capabilities(&self, _: AdapterServerCapabilities) -> bool {
+        true
+    }
+
     fn to_lsp(
         &self,
         path: &Path,
@@ -240,6 +370,10 @@ impl LspCommand for GoToParentModule {
         "Go to parent module"
     }
 
+    fn check_capabilities(&self, _: AdapterServerCapabilities) -> bool {
+        true
+    }
+
     fn to_lsp(
         &self,
         path: &Path,
@@ -266,6 +400,57 @@ impl LspCommand for GoToParentModule {
             cx,
         )
         .await
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::LspExtGoToParentModule {
+        proto::LspExtGoToParentModule {
+            project_id,
+            buffer_id: buffer.remote_id().to_proto(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+        }
+    }
+
+    async fn from_proto(
+        request: Self::ProtoRequest,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        cx: AsyncApp,
+    ) -> anyhow::Result<Self> {
+        let position = request
+            .position
+            .and_then(deserialize_anchor)
+            .context("bad request with bad position")?;
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        links: Vec<LocationLink>,
+        lsp_store: &mut LspStore,
+        peer_id: PeerId,
+        _: &clock::Global,
+        cx: &mut App,
+    ) -> proto::LspExtGoToParentModuleResponse {
+        proto::LspExtGoToParentModuleResponse {
+            links: location_links_to_proto(links, lsp_store, peer_id, cx),
+        }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::LspExtGoToParentModuleResponse,
+        lsp_store: Entity<LspStore>,
+        _: Entity<Buffer>,
+        cx: AsyncApp,
+    ) -> anyhow::Result<Vec<LocationLink>> {
+        location_links_from_proto(message.links, lsp_store, cx).await
+    }
+
+    fn buffer_id_from_proto(message: &proto::LspExtGoToParentModule) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
     }
 }
 
@@ -362,6 +547,10 @@ impl LspCommand for GetLspRunnables {
         "LSP Runnables"
     }
 
+    fn check_capabilities(&self, _: AdapterServerCapabilities) -> bool {
+        true
+    }
+
     fn to_lsp(
         &self,
         path: &Path,
@@ -369,10 +558,7 @@ impl LspCommand for GetLspRunnables {
         _: &Arc<LanguageServer>,
         _: &App,
     ) -> Result<RunnablesParams> {
-        let url = match lsp::url_from_file_path(path) {
-            Ok(url) => url,
-            Err(()) => anyhow::bail!("Failed to parse path {path:?} as lsp::Url"),
-        };
+        let url = file_path_to_lsp_url(path)?;
         Ok(RunnablesParams {
             text_document: lsp::TextDocumentIdentifier::new(url),
             position: self
@@ -424,6 +610,7 @@ impl LspCommand for GetLspRunnables {
                     );
                     task_template.args.extend(cargo.cargo_args);
                     if !cargo.executable_args.is_empty() {
+                        let shell_kind = task_template.shell.shell_kind(cfg!(windows));
                         task_template.args.push("--".to_string());
                         task_template.args.extend(
                             cargo
@@ -449,7 +636,7 @@ impl LspCommand for GetLspRunnables {
                                 // That bit is not auto-expanded when using single quotes.
                                 // Escape extra cargo args unconditionally as those are unlikely to contain `~`.
                                 .flat_map(|extra_arg| {
-                                    shlex::try_quote(&extra_arg).ok().map(|s| s.to_string())
+                                    shell_kind.try_quote(&extra_arg).map(|s| s.to_string())
                                 }),
                         );
                     }
@@ -458,7 +645,7 @@ impl LspCommand for GetLspRunnables {
                     task_template.command = shell.program;
                     task_template.args = shell.args;
                     task_template.env = shell.environment;
-                    task_template.cwd = Some(shell.cwd.to_string_lossy().to_string());
+                    task_template.cwd = Some(shell.cwd.to_string_lossy().into_owned());
                 }
             }
 

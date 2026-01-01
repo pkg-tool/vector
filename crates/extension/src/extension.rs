@@ -1,4 +1,5 @@
 pub mod api;
+mod capabilities;
 pub mod extension_builder;
 mod extension_events;
 mod extension_host_proxy;
@@ -14,8 +15,11 @@ use async_trait::async_trait;
 use fs::normalize_path;
 use gpui::{App, Task};
 use language::LanguageName;
-use semantic_version::SemanticVersion;
+use semver::Version;
+use task::{SpawnInTerminal, VectorDebugConfig};
+use util::rel_path::RelPath;
 
+pub use crate::capabilities::*;
 pub use crate::extension_events::*;
 pub use crate::extension_host_proxy::*;
 pub use crate::extension_manifest::*;
@@ -31,7 +35,7 @@ pub fn init(cx: &mut App) {
 pub trait WorktreeDelegate: Send + Sync + 'static {
     fn id(&self) -> u64;
     fn root_path(&self) -> String;
-    async fn read_text_file(&self, path: PathBuf) -> Result<String>;
+    async fn read_text_file(&self, path: &RelPath) -> Result<String>;
     async fn which(&self, binary_name: String) -> Option<String>;
     async fn shell_env(&self) -> Vec<(String, String)>;
 }
@@ -145,28 +149,43 @@ pub trait Extension: Send + Sync + 'static {
         worktree: Arc<dyn WorktreeDelegate>,
     ) -> Result<DebugAdapterBinary>;
 
-    async fn get_dap_schema(&self) -> Result<serde_json::Value>;
+    async fn dap_request_kind(
+        &self,
+        dap_name: Arc<str>,
+        config: serde_json::Value,
+    ) -> Result<StartDebuggingRequestArgumentsRequest>;
+
+    async fn dap_config_to_scenario(&self, config: VectorDebugConfig) -> Result<DebugScenario>;
+
+    async fn dap_locator_create_scenario(
+        &self,
+        locator_name: String,
+        build_config_template: BuildTaskTemplate,
+        resolved_label: String,
+        debug_adapter_name: String,
+    ) -> Result<Option<DebugScenario>>;
+    async fn run_dap_locator(
+        &self,
+        locator_name: String,
+        config: SpawnInTerminal,
+    ) -> Result<DebugRequest>;
 }
 
-pub fn parse_wasm_extension_version(
-    extension_id: &str,
-    wasm_bytes: &[u8],
-) -> Result<SemanticVersion> {
+pub fn parse_wasm_extension_version(extension_id: &str, wasm_bytes: &[u8]) -> Result<Version> {
     let mut version = None;
 
     for part in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
         if let wasmparser::Payload::CustomSection(s) =
             part.context("error parsing wasm extension")?
+            && s.name() == "zed:api-version"
         {
-            if s.name() == "vector:api-version" {
-                version = parse_wasm_extension_version_custom_section(s.data());
-                if version.is_none() {
-                    bail!(
-                        "extension {} has invalid vector:api-version section: {:?}",
-                        extension_id,
-                        s.data()
-                    );
-                }
+            version = parse_wasm_extension_version_custom_section(s.data());
+            if version.is_none() {
+                bail!(
+                    "extension {} has invalid zed:api-version section: {:?}",
+                    extension_id,
+                    s.data()
+                );
             }
         }
     }
@@ -179,9 +198,9 @@ pub fn parse_wasm_extension_version(
     version.with_context(|| format!("extension {extension_id} has no vector:api-version section"))
 }
 
-fn parse_wasm_extension_version_custom_section(data: &[u8]) -> Option<SemanticVersion> {
+fn parse_wasm_extension_version_custom_section(data: &[u8]) -> Option<Version> {
     if data.len() == 6 {
-        Some(SemanticVersion::new(
+        Some(Version::new(
             u16::from_be_bytes([data[0], data[1]]) as _,
             u16::from_be_bytes([data[2], data[3]]) as _,
             u16::from_be_bytes([data[4], data[5]]) as _,

@@ -33,4 +33,4 @@ Once you have the cli, simply from a terminal, navigate to your project and run
 vector .
 ```
 
-Voila! You should have Vector running with OCaml support, no additional setup required.
+Voilà! You should have Zed running with OCaml support, no additional setup required.

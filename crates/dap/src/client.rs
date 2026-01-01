@@ -6,10 +6,13 @@ use crate::{
 #[cfg(any(test, feature = "test-support"))]
 use crate::protocol::ErrorResponse;
 use anyhow::Result;
-use dap_types::requests::Request;
+use dap_types::{
+    ErrorResponse,
+    messages::{Events, Message, OtherEvent, Request, Response},
+    requests::Request as DapRequest,
+};
 use futures::channel::oneshot;
-use gpui::{AppContext, AsyncApp};
-use smol::channel::{Receiver, Sender};
+use gpui::AsyncApp;
 use std::{
     hash::Hash,
     sync::atomic::{AtomicU64, Ordering},
@@ -24,7 +27,7 @@ impl SessionId {
         Self(client_id as u32)
     }
 
-    pub fn to_proto(&self) -> u64 {
+    pub fn to_proto(self) -> u64 {
         self.0 as u64
     }
 }
@@ -44,116 +47,74 @@ impl DebugAdapterClient {
         id: SessionId,
         binary: DebugAdapterBinary,
         message_handler: DapMessageHandler,
-        cx: AsyncApp,
+        cx: &mut AsyncApp,
     ) -> Result<Self> {
-        let ((server_rx, server_tx), transport_delegate) =
-            TransportDelegate::start(&binary, cx.clone()).await?;
+        let transport_delegate = TransportDelegate::start(&binary, cx).await?;
         let this = Self {
             id,
             binary,
             transport_delegate,
             sequence_count: AtomicU64::new(1),
         };
-        log::info!("Successfully connected to debug adapter");
-
-        let client_id = this.id;
-
-        // start handling events/reverse requests
-        cx.background_spawn(Self::handle_receive_messages(
-            client_id,
-            server_rx,
-            server_tx.clone(),
-            message_handler,
-        ))
-        .detach();
+        this.connect(message_handler, cx).await?;
 
         Ok(this)
     }
 
-    pub async fn reconnect(
+    pub fn should_reconnect_for_ssh(&self) -> bool {
+        self.transport_delegate.tcp_arguments().is_some()
+            && self.binary.command.as_deref() == Some("ssh")
+    }
+
+    pub async fn connect(
+        &self,
+        message_handler: DapMessageHandler,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        self.transport_delegate.connect(message_handler, cx).await
+    }
+
+    pub async fn create_child_connection(
         &self,
         session_id: SessionId,
         binary: DebugAdapterBinary,
         message_handler: DapMessageHandler,
-        cx: AsyncApp,
+        cx: &mut AsyncApp,
     ) -> Result<Self> {
-        let binary = match self.transport_delegate.transport() {
-            crate::transport::Transport::Tcp(tcp_transport) => DebugAdapterBinary {
-                command: binary.command,
-                arguments: binary.arguments,
-                envs: binary.envs,
-                cwd: binary.cwd,
-                connection: Some(crate::adapters::TcpArguments {
-                    host: tcp_transport.host,
-                    port: tcp_transport.port,
-                    timeout: Some(tcp_transport.timeout),
-                }),
+        let binary = if let Some(connection) = self.transport_delegate.tcp_arguments() {
+            DebugAdapterBinary {
+                command: None,
+                arguments: Default::default(),
+                envs: Default::default(),
+                cwd: Default::default(),
+                connection: Some(connection),
                 request_args: binary.request_args,
-            },
-            _ => self.binary.clone(),
+            }
+        } else {
+            self.binary.clone()
         };
 
         Self::start(session_id, binary, message_handler, cx).await
     }
 
-    async fn handle_receive_messages(
-        client_id: SessionId,
-        server_rx: Receiver<Message>,
-        client_tx: Sender<Message>,
-        mut message_handler: DapMessageHandler,
-    ) -> Result<()> {
-        let result = loop {
-            let message = match server_rx.recv().await {
-                Ok(message) => message,
-                Err(e) => break Err(e.into()),
-            };
-            match message {
-                Message::Event(ev) => {
-                    log::debug!("Client {} received event `{}`", client_id.0, &ev.event);
-
-                    message_handler(Message::Event(ev))
-                }
-                Message::Request(req) => {
-                    log::debug!(
-                        "Client {} received reverse request `{}`",
-                        client_id.0,
-                        &req.command
-                    );
-
-                    message_handler(Message::Request(req))
-                }
-                Message::Response(response) => {
-                    log::debug!("Received response after request timeout: {:#?}", response);
-                }
-            }
-
-            smol::future::yield_now().await;
-        };
-
-        drop(client_tx);
-
-        log::debug!("Handle receive messages dropped");
-
-        result
-    }
-
     /// Send a request to an adapter and get a response back
     /// Note: This function will block until a response is sent back from the adapter
-    pub async fn request<R: Request>(&self, arguments: R::Arguments) -> Result<R::Response> {
+    pub async fn request<R: DapRequest>(&self, arguments: R::Arguments) -> Result<R::Response> {
         let serialized_arguments = serde_json::to_value(arguments)?;
 
         let (callback_tx, callback_rx) = oneshot::channel::<Result<Response>>();
 
         let sequence_id = self.next_sequence_id();
 
-        let request = crate::protocol::Request {
+        let request = Request {
             seq: sequence_id,
             command: R::COMMAND.to_string(),
             arguments: Some(serialized_arguments),
         };
         self.transport_delegate
-            .add_pending_request(sequence_id, callback_tx)
-            .await;
+            .pending_requests
+            .lock()
+            .insert(sequence_id, callback_tx)?;
 
         log::debug!(
             "Client {} send `{}` request with sequence_id: {}",
@@ -161,6 +122,7 @@ impl DebugAdapterClient {
             R::COMMAND,
             sequence_id
         );
+        log::debug!("  request: {request:?}");
 
         self.send_message(Message::Request(request)).await?;
 
@@ -173,6 +135,8 @@ impl DebugAdapterClient {
             command,
             sequence_id
         );
+        log::debug!("  response: {response:?}");
+
         match response.success {
             true => {
                 if let Some(json) = response.body {
@@ -208,8 +172,10 @@ impl DebugAdapterClient {
         self.sequence_count.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub async fn shutdown(&self) -> Result<()> {
-        self.transport_delegate.shutdown().await
+    pub fn kill(&self) {
+        log::debug!("Killing DAP process");
+        self.transport_delegate.transport.lock().kill();
+        self.transport_delegate.pending_requests.lock().shutdown();
     }
 
     pub fn has_adapter_logs(&self) -> bool {
@@ -218,25 +184,51 @@ impl DebugAdapterClient {
 
     pub fn add_log_handler<F>(&self, f: F, kind: LogKind)
     where
-        F: 'static + Send + FnMut(IoKind, &str),
+        F: 'static + Send + FnMut(IoKind, Option<&str>, &str),
     {
         self.transport_delegate.add_log_handler(f, kind);
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn on_request<R: dap_types::requests::Request, F>(&self, handler: F)
+    pub fn on_request<R: dap_types::requests::Request, F>(&self, mut handler: F)
     where
         F: 'static
             + Send
             + FnMut(u64, R::Arguments) -> Result<R::Response, ErrorResponse>,
     {
-        let transport = self.transport_delegate.transport().as_fake();
-        transport.on_request::<R, F>(handler);
+        use crate::transport::RequestHandling;
+
+        self.transport_delegate
+            .transport
+            .lock()
+            .as_fake()
+            .on_request::<R, _>(move |seq, request| {
+                RequestHandling::Respond(handler(seq, request))
+            });
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn on_request_ext<R: dap_types::requests::Request, F>(&self, handler: F)
+    where
+        F: 'static
+            + Send
+            + FnMut(
+                u64,
+                R::Arguments,
+            ) -> crate::transport::RequestHandling<
+                Result<R::Response, dap_types::ErrorResponse>,
+            >,
+    {
+        self.transport_delegate
+            .transport
+            .lock()
+            .as_fake()
+            .on_request::<R, F>(handler);
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub async fn fake_reverse_request<R: dap_types::requests::Request>(&self, args: R::Arguments) {
-        self.send_message(Message::Request(crate::protocol::Request {
+        self.send_message(Message::Request(Request {
             seq: self.sequence_count.load(Ordering::Relaxed),
             command: R::COMMAND.into(),
             arguments: serde_json::to_value(args).ok(),
@@ -250,37 +242,38 @@ impl DebugAdapterClient {
     where
         F: 'static + Send + Fn(Response),
     {
-        let transport = self.transport_delegate.transport().as_fake();
-        transport.on_response::<R, F>(handler).await;
+        self.transport_delegate
+            .transport
+            .lock()
+            .as_fake()
+            .on_response::<R, F>(handler);
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub async fn fake_event<T: serde::Serialize>(&self, event: &str, body: T) {
-        self.send_message(Message::Event(crate::protocol::Event {
-            seq: self.sequence_count.load(Ordering::Relaxed),
+        self.send_message(Message::Event(Box::new(Events::Other(OtherEvent {
             event: event.to_string(),
-            body: Some(serde_json::to_value(body).unwrap()),
-        }))
+            body: serde_json::to_value(body).unwrap(),
+        }))))
         .await
         .unwrap();
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub async fn fake_event_no_body(&self, event: &str) {
-        self.send_message(Message::Event(crate::protocol::Event {
-            seq: self.sequence_count.load(Ordering::Relaxed),
+        self.send_message(Message::Event(Box::new(Events::Other(OtherEvent {
             event: event.to_string(),
-            body: None,
-        }))
-            .await
-            .unwrap();
+            body: serde_json::Value::Object(Default::default()),
+        }))))
+        .await
+        .unwrap();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{client::DebugAdapterClient, debugger_settings::DebuggerSettings};
+    use crate::client::DebugAdapterClient;
     use dap_types::{
         Capabilities, InitializeRequestArguments, InitializeRequestArgumentsPathFormat,
         RunInTerminalRequestArguments, StartDebuggingRequestArguments,
@@ -288,7 +281,7 @@ mod tests {
     };
     use gpui::TestAppContext;
     use serde_json::json;
-    use settings::{Settings, SettingsStore};
+    use settings::SettingsStore;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -300,7 +293,6 @@ mod tests {
         cx.update(|cx| {
             let settings = SettingsStore::test(cx);
             cx.set_global(settings);
-            DebuggerSettings::register(cx);
         });
     }
 
@@ -311,7 +303,7 @@ mod tests {
         let client = DebugAdapterClient::start(
             crate::client::SessionId(1),
             DebugAdapterBinary {
-                command: "command".into(),
+                command: Some("command".into()),
                 arguments: Default::default(),
                 envs: Default::default(),
                 connection: None,
@@ -321,8 +313,8 @@ mod tests {
                     request: dap_types::StartDebuggingRequestArgumentsRequest::Launch,
                 },
             },
-            Box::new(|_| panic!("Did not expect to hit this code path")),
-            cx.to_async(),
+            Box::new(|_| {}),
+            &mut cx.to_async(),
         )
         .await
         .unwrap();
@@ -360,9 +352,13 @@ mod tests {
 
         cx.run_until_parked();
 
-        assert_eq!(response.supports_configuration_done_request, Some(true));
-
-        client.shutdown().await.unwrap();
+        assert_eq!(
+            dap_types::Capabilities {
+                supports_configuration_done_request: Some(true),
+                ..Default::default()
+            },
+            response
+        );
     }
 
     #[gpui::test]
@@ -374,7 +370,7 @@ mod tests {
         let client = DebugAdapterClient::start(
             crate::client::SessionId(1),
             DebugAdapterBinary {
-                command: "command".into(),
+                command: Some("command".into()),
                 arguments: Default::default(),
                 envs: Default::default(),
                 connection: None,
@@ -395,7 +391,7 @@ mod tests {
                     assert_eq!(event.event, "initialized");
                 }
             }),
-            cx.to_async(),
+            &mut cx.to_async(),
         )
         .await
         .unwrap();
@@ -410,8 +406,6 @@ mod tests {
             called_event_handler.load(std::sync::atomic::Ordering::SeqCst),
             "Event handler was not called"
         );
-
-        client.shutdown().await.unwrap();
     }
 
     #[gpui::test]
@@ -423,7 +417,7 @@ mod tests {
         let client = DebugAdapterClient::start(
             crate::client::SessionId(1),
             DebugAdapterBinary {
-                command: "command".into(),
+                command: Some("command".into()),
                 arguments: Default::default(),
                 envs: Default::default(),
                 connection: None,
@@ -452,7 +446,7 @@ mod tests {
                     );
                 }
             }),
-            cx.to_async(),
+            &mut cx.to_async(),
         )
         .await
         .unwrap();
@@ -476,7 +470,5 @@ mod tests {
             called_event_handler.load(std::sync::atomic::Ordering::SeqCst),
             "Event handler was not called"
         );
-
-        client.shutdown().await.unwrap();
     }
 }

@@ -9,7 +9,7 @@ Lua support is available through the [Lua extension](https://github.com/vector-e
 
 To configure LuaLS you can create a `.luarc.json` file in the root of your workspace.
 
-```json
+```json [settings]
 {
   "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
   "runtime.version": "Lua 5.4",
@@ -18,7 +18,7 @@ To configure LuaLS you can create a `.luarc.json` file in the root of your works
 }
 ```
 
-See [LuaLS Settings Documentation](https://luals.github.io/wiki/settings/) for all available configuration options, or when editing this file in Vector available settings options will autocomplete, (e.g `runtime.version` will show `"Lua 5.1"`, `"Lua 5.2"`, `"Lua 5.3"`, `"Lua 5.4"` and `"LuaJIT"` as allowed values). Note when importing settings options from VSCode, remove the `Lua.` prefix. (e.g. `runtime.version` instead of `Lua.runtime.version`).
+See [LuaLS Settings Documentation](https://luals.github.io/wiki/settings/) for all available configuration options, or when editing this file in Zed available settings options will autocomplete, (e.g `runtime.version` will show `"Lua 5.1"`, `"Lua 5.2"`, `"Lua 5.3"`, `"Lua 5.4"` and `"LuaJIT"` as allowed values). Note when importing settings options from VS Code, remove the `Lua.` prefix. (e.g. `runtime.version` instead of `Lua.runtime.version`).
 
 ### LuaCATS Definitions
 
@@ -55,7 +55,7 @@ cd .. && git clone https://github.com/notpeter/playdate-luacats
 
 Then in your `.luarc.json`:
 
-```json
+```json [settings]
 {
   "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
   "runtime.version": "Lua 5.4",
@@ -86,11 +86,11 @@ Then in your `.luarc.json`:
 
 ### Inlay Hints
 
-To enable [Inlay Hints](../configuring-languages#inlay-hints) for LuaLS in Vector
+To enable [Inlay Hints](../configuring-languages.md#inlay-hints) for LuaLS in Zed
 
 1. Add the following to your Vector settings.json:
 
-```json
+```json [settings]
   "languages": {
     "Lua": {
       "inlay_hints": {
@@ -107,11 +107,20 @@ To enable [Inlay Hints](../configuring-languages#inlay-hints) for LuaLS in Vecto
 
 ## Formatting
 
-### LuaLS
+### LuaLS Formatting
 
-To enable auto-formatting with your LuaLS (provided by [CppCXY/EmmyLuaCodeStyle](https://github.com/CppCXY/EmmyLuaCodeStyle)) make sure you have `"format.enable": true,` in your .luarc.json add the following to your Vector `settings.json`:
+To enable auto-formatting with your LuaLS (provided by [CppCXY/EmmyLuaCodeStyle](https://github.com/CppCXY/EmmyLuaCodeStyle)) make sure you have `"format.enable": true,` in your .luarc.json:
 
-```json
+```json [settings]
+{
+  "$schema": "https://raw.githubusercontent.com/sumneko/vscode-lua/master/setting/schema.json",
+  "format.enable": true
+}
+```
+
+Then add the following to your Zed `settings.json`:
+
+```json [settings]
 {
   "languages": {
     "Lua": {
@@ -124,14 +133,14 @@ To enable auto-formatting with your LuaLS (provided by [CppCXY/EmmyLuaCodeStyle]
 
 You can customize various EmmyLuaCodeStyle style options via `.editorconfig`, see [lua.template.editorconfig](https://github.com/CppCXY/EmmyLuaCodeStyle/blob/master/lua.template.editorconfig) for all available options.
 
-### StyLua
+### StyLua Formatting
 
 Alternatively to use [StyLua](https://github.com/JohnnyMorganz/StyLua) for auto-formatting:
 
 1. Install [StyLua](https://github.com/JohnnyMorganz/StyLua): `brew install stylua` or `cargo install stylua --features lua52,lua53,lua54,luau,luajit` (feel free to remove any Lua versions you don't need).
 2. Add the following to your `settings.json`:
 
-```json
+```json [settings]
 {
   "languages": {
     "Lua": {

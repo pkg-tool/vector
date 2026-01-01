@@ -1,16 +1,24 @@
 #![allow(unused, dead_code)]
-use gpui::{AnyElement, App, Entity, EventEmitter, FocusHandle, Focusable, Hsla, actions, hsla};
+use gpui::{
+    AnyElement, App, Entity, EventEmitter, FocusHandle, Focusable, Hsla, Task, actions, hsla,
+};
 use strum::IntoEnumIterator;
 use theme::all_theme_colors;
 use ui::{
-    Avatar, ButtonLike, Checkbox, CheckboxWithLabel, ContentGroup, DecoratedIcon, ElevationIndex,
-    IconDecoration, Indicator, KeybindingHint, Switch, Table, TintColor, Tooltip, element_cell,
-    prelude::*, string_cell, utils::calculate_contrast_ratio,
+    Avatar, ButtonLike, Checkbox, ContentGroup, DecoratedIcon, ElevationIndex, IconDecoration,
+    Indicator, KeybindingHint, Switch, TintColor, Tooltip, prelude::*,
+    utils::calculate_contrast_ratio,
 };
 
 use crate::{Item, Workspace};
 
-actions!(dev, [OpenThemePreview]);
+actions!(
+    dev,
+    [
+        /// Opens the theme preview window.
+        OpenThemePreview
+    ]
+);
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -84,16 +92,20 @@ impl Item for ThemePreview {
         format!("{} Preview", name).into()
     }
 
+    fn can_split(&self) -> bool {
+        true
+    }
+
     fn clone_on_split(
         &self,
         _workspace_id: Option<crate::WorkspaceId>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<Entity<Self>>
+    ) -> Task<Option<Entity<Self>>>
     where
         Self: Sized,
     {
-        Some(cx.new(|cx| Self::new(window, cx)))
+        Task::ready(Some(cx.new(|cx| Self::new(window, cx))))
     }
 }
 
@@ -292,7 +304,6 @@ impl ThemePreview {
                     .gap_1()
                     .children(all_colors.into_iter().map(|(color, name)| {
                         let id = ElementId::Name(format!("{:?}-preview", color).into());
-                        let name = name.clone();
                         div().size_8().flex_none().child(
                             ButtonLike::new(id)
                                 .child(
@@ -307,13 +318,7 @@ impl ThemePreview {
                                 .style(ButtonStyle::Transparent)
                                 .tooltip(move |window, cx| {
                                     let name = name.clone();
-                                    Tooltip::with_meta(
-                                        name,
-                                        None,
-                                        format!("{:?}", color),
-                                        window,
-                                        cx,
-                                    )
+                                    Tooltip::with_meta(name, None, format!("{:?}", color), cx)
                                 }),
                         )
                     })),

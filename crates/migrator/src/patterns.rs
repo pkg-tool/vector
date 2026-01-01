@@ -8,4 +8,5 @@ pub(crate) use keymap::{
 
 pub(crate) use settings::{
     SETTINGS_LANGUAGES_PATTERN, SETTINGS_NESTED_KEY_VALUE_PATTERN, SETTINGS_ROOT_KEY_VALUE_PATTERN,
+    migrate_language_setting,
 };

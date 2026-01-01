@@ -1,17 +1,9 @@
-use crate::{
-    EntryKind, Event, PathChange, WorkDirectory, Worktree, WorktreeModelHandle,
-    worktree_settings::WorktreeSettings,
-};
-#[cfg(feature = "remote")]
+use crate::{Entry, EntryKind, Event, PathChange, Worktree, WorktreeModelHandle};
 use anyhow::Result;
-use fs::{FakeFs, Fs, RealFs};
-#[cfg(feature = "remote")]
-use fs::RemoveOptions;
-#[cfg(feature = "remote")]
-use git::GITIGNORE;
-use gpui::{BackgroundExecutor, BorrowAppContext, TestAppContext};
-#[cfg(feature = "remote")]
-use gpui::{Context, Task};
+use encoding_rs;
+use fs::{FakeFs, Fs, RealFs, RemoveOptions};
+use git::{DOT_GIT, GITIGNORE, REPO_EXCLUDE};
+use gpui::{AppContext as _, BackgroundExecutor, BorrowAppContext, Context, Task, TestAppContext};
 use parking_lot::Mutex;
 use postage::prelude::Stream as _;
 use pretty_assertions::assert_eq;
@@ -19,19 +11,18 @@ use pretty_assertions::assert_eq;
 use rand::prelude::*;
 
 use serde_json::json;
-use settings::{Settings, SettingsStore};
+use settings::SettingsStore;
 use std::{
     mem,
     path::{Path, PathBuf},
     sync::Arc,
 };
-use util::{path, test::TempTree};
-
-#[cfg(feature = "remote")]
-use std::fmt::Write as _;
-
-#[cfg(feature = "remote")]
-use util::ResultExt as _;
+use util::{
+    ResultExt, path,
+    paths::PathStyle,
+    rel_path::{RelPath, rel_path},
+    test::TempTree,
+};
 
 #[gpui::test]
 async fn test_traversal(cx: &mut TestAppContext) {
@@ -54,6 +45,7 @@ async fn test_traversal(cx: &mut TestAppContext) {
         true,
         fs,
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -67,10 +59,10 @@ async fn test_traversal(cx: &mut TestAppContext) {
                 .map(|entry| entry.path.as_ref())
                 .collect::<Vec<_>>(),
             vec![
-                Path::new(""),
-                Path::new(".gitignore"),
-                Path::new("a"),
-                Path::new("a/c"),
+                rel_path(""),
+                rel_path(".gitignore"),
+                rel_path("a"),
+                rel_path("a/c"),
             ]
         );
         assert_eq!(
@@ -78,11 +70,11 @@ async fn test_traversal(cx: &mut TestAppContext) {
                 .map(|entry| entry.path.as_ref())
                 .collect::<Vec<_>>(),
             vec![
-                Path::new(""),
-                Path::new(".gitignore"),
-                Path::new("a"),
-                Path::new("a/b"),
-                Path::new("a/c"),
+                rel_path(""),
+                rel_path(".gitignore"),
+                rel_path("a"),
+                rel_path("a/b"),
+                rel_path("a/c"),
             ]
         );
     })
@@ -118,6 +110,7 @@ async fn test_circular_symlinks(cx: &mut TestAppContext) {
         true,
         fs.clone(),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -132,14 +125,14 @@ async fn test_circular_symlinks(cx: &mut TestAppContext) {
                 .map(|entry| entry.path.as_ref())
                 .collect::<Vec<_>>(),
             vec![
-                Path::new(""),
-                Path::new("lib"),
-                Path::new("lib/a"),
-                Path::new("lib/a/a.txt"),
-                Path::new("lib/a/lib"),
-                Path::new("lib/b"),
-                Path::new("lib/b/b.txt"),
-                Path::new("lib/b/lib"),
+                rel_path(""),
+                rel_path("lib"),
+                rel_path("lib/a"),
+                rel_path("lib/a/a.txt"),
+                rel_path("lib/a/lib"),
+                rel_path("lib/b"),
+                rel_path("lib/b/b.txt"),
+                rel_path("lib/b/lib"),
             ]
         );
     });
@@ -158,14 +151,14 @@ async fn test_circular_symlinks(cx: &mut TestAppContext) {
                 .map(|entry| entry.path.as_ref())
                 .collect::<Vec<_>>(),
             vec![
-                Path::new(""),
-                Path::new("lib"),
-                Path::new("lib/a"),
-                Path::new("lib/a/a.txt"),
-                Path::new("lib/a/lib-2"),
-                Path::new("lib/b"),
-                Path::new("lib/b/b.txt"),
-                Path::new("lib/b/lib"),
+                rel_path(""),
+                rel_path("lib"),
+                rel_path("lib/a"),
+                rel_path("lib/a/a.txt"),
+                rel_path("lib/a/lib-2"),
+                rel_path("lib/b"),
+                rel_path("lib/b/b.txt"),
+                rel_path("lib/b/lib"),
             ]
         );
     });
@@ -217,6 +210,7 @@ async fn test_symlinks_pointing_outside(cx: &mut TestAppContext) {
         true,
         fs.clone(),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -247,18 +241,18 @@ async fn test_symlinks_pointing_outside(cx: &mut TestAppContext) {
                 .map(|entry| (entry.path.as_ref(), entry.is_external))
                 .collect::<Vec<_>>(),
             vec![
-                (Path::new(""), false),
-                (Path::new("deps"), false),
-                (Path::new("deps/dep-dir2"), true),
-                (Path::new("deps/dep-dir3"), true),
-                (Path::new("src"), false),
-                (Path::new("src/a.rs"), false),
-                (Path::new("src/b.rs"), false),
+                (rel_path(""), false),
+                (rel_path("deps"), false),
+                (rel_path("deps/dep-dir2"), true),
+                (rel_path("deps/dep-dir3"), true),
+                (rel_path("src"), false),
+                (rel_path("src/a.rs"), false),
+                (rel_path("src/b.rs"), false),
             ]
         );
 
         assert_eq!(
-            tree.entry_for_path("deps/dep-dir2").unwrap().kind,
+            tree.entry_for_path(rel_path("deps/dep-dir2")).unwrap().kind,
             EntryKind::UnloadedDir
         );
     });
@@ -267,7 +261,7 @@ async fn test_symlinks_pointing_outside(cx: &mut TestAppContext) {
     tree.read_with(cx, |tree, _| {
         tree.as_local()
             .unwrap()
-            .refresh_entries_for_paths(vec![Path::new("deps/dep-dir3").into()])
+            .refresh_entries_for_paths(vec![rel_path("deps/dep-dir3").into()])
     })
     .recv()
     .await;
@@ -280,24 +274,24 @@ async fn test_symlinks_pointing_outside(cx: &mut TestAppContext) {
                 .map(|entry| (entry.path.as_ref(), entry.is_external))
                 .collect::<Vec<_>>(),
             vec![
-                (Path::new(""), false),
-                (Path::new("deps"), false),
-                (Path::new("deps/dep-dir2"), true),
-                (Path::new("deps/dep-dir3"), true),
-                (Path::new("deps/dep-dir3/deps"), true),
-                (Path::new("deps/dep-dir3/src"), true),
-                (Path::new("src"), false),
-                (Path::new("src/a.rs"), false),
-                (Path::new("src/b.rs"), false),
+                (rel_path(""), false),
+                (rel_path("deps"), false),
+                (rel_path("deps/dep-dir2"), true),
+                (rel_path("deps/dep-dir3"), true),
+                (rel_path("deps/dep-dir3/deps"), true),
+                (rel_path("deps/dep-dir3/src"), true),
+                (rel_path("src"), false),
+                (rel_path("src/a.rs"), false),
+                (rel_path("src/b.rs"), false),
             ]
         );
     });
     assert_eq!(
         mem::take(&mut *tree_updates.lock()),
         &[
-            (Path::new("deps/dep-dir3").into(), PathChange::Loaded),
-            (Path::new("deps/dep-dir3/deps").into(), PathChange::Loaded),
-            (Path::new("deps/dep-dir3/src").into(), PathChange::Loaded)
+            (rel_path("deps/dep-dir3").into(), PathChange::Loaded),
+            (rel_path("deps/dep-dir3/deps").into(), PathChange::Loaded),
+            (rel_path("deps/dep-dir3/src").into(), PathChange::Loaded)
         ]
     );
 
@@ -305,7 +299,7 @@ async fn test_symlinks_pointing_outside(cx: &mut TestAppContext) {
     tree.read_with(cx, |tree, _| {
         tree.as_local()
             .unwrap()
-            .refresh_entries_for_paths(vec![Path::new("deps/dep-dir3/src").into()])
+            .refresh_entries_for_paths(vec![rel_path("deps/dep-dir3/src").into()])
     })
     .recv()
     .await;
@@ -317,17 +311,17 @@ async fn test_symlinks_pointing_outside(cx: &mut TestAppContext) {
                 .map(|entry| (entry.path.as_ref(), entry.is_external))
                 .collect::<Vec<_>>(),
             vec![
-                (Path::new(""), false),
-                (Path::new("deps"), false),
-                (Path::new("deps/dep-dir2"), true),
-                (Path::new("deps/dep-dir3"), true),
-                (Path::new("deps/dep-dir3/deps"), true),
-                (Path::new("deps/dep-dir3/src"), true),
-                (Path::new("deps/dep-dir3/src/e.rs"), true),
-                (Path::new("deps/dep-dir3/src/f.rs"), true),
-                (Path::new("src"), false),
-                (Path::new("src/a.rs"), false),
-                (Path::new("src/b.rs"), false),
+                (rel_path(""), false),
+                (rel_path("deps"), false),
+                (rel_path("deps/dep-dir2"), true),
+                (rel_path("deps/dep-dir3"), true),
+                (rel_path("deps/dep-dir3/deps"), true),
+                (rel_path("deps/dep-dir3/src"), true),
+                (rel_path("deps/dep-dir3/src/e.rs"), true),
+                (rel_path("deps/dep-dir3/src/f.rs"), true),
+                (rel_path("src"), false),
+                (rel_path("src/a.rs"), false),
+                (rel_path("src/b.rs"), false),
             ]
         );
     });
@@ -335,13 +329,13 @@ async fn test_symlinks_pointing_outside(cx: &mut TestAppContext) {
     assert_eq!(
         mem::take(&mut *tree_updates.lock()),
         &[
-            (Path::new("deps/dep-dir3/src").into(), PathChange::Loaded),
+            (rel_path("deps/dep-dir3/src").into(), PathChange::Loaded),
             (
-                Path::new("deps/dep-dir3/src/e.rs").into(),
+                rel_path("deps/dep-dir3/src/e.rs").into(),
                 PathChange::Loaded
             ),
             (
-                Path::new("deps/dep-dir3/src/f.rs").into(),
+                rel_path("deps/dep-dir3/src/f.rs").into(),
                 PathChange::Loaded
             )
         ]
@@ -367,6 +361,7 @@ async fn test_renaming_case_only(cx: &mut TestAppContext) {
         true,
         fs.clone(),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -379,7 +374,7 @@ async fn test_renaming_case_only(cx: &mut TestAppContext) {
             tree.entries(true, 0)
                 .map(|entry| entry.path.as_ref())
                 .collect::<Vec<_>>(),
-            vec![Path::new(""), Path::new(OLD_NAME)]
+            vec![rel_path(""), rel_path(OLD_NAME)]
         );
     });
 
@@ -389,6 +384,7 @@ async fn test_renaming_case_only(cx: &mut TestAppContext) {
         fs::RenameOptions {
             overwrite: true,
             ignore_if_exists: true,
+            create_parents: false,
         },
     )
     .await
@@ -401,7 +397,7 @@ async fn test_renaming_case_only(cx: &mut TestAppContext) {
             tree.entries(true, 0)
                 .map(|entry| entry.path.as_ref())
                 .collect::<Vec<_>>(),
-            vec![Path::new(""), Path::new(NEW_NAME)]
+            vec![rel_path(""), rel_path(NEW_NAME)]
         );
     });
 }
@@ -443,6 +439,7 @@ async fn test_open_gitignored_files(cx: &mut TestAppContext) {
         true,
         fs.clone(),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -457,13 +454,13 @@ async fn test_open_gitignored_files(cx: &mut TestAppContext) {
                 .map(|entry| (entry.path.as_ref(), entry.is_ignored))
                 .collect::<Vec<_>>(),
             vec![
-                (Path::new(""), false),
-                (Path::new(".gitignore"), false),
-                (Path::new("one"), false),
-                (Path::new("one/node_modules"), true),
-                (Path::new("two"), false),
-                (Path::new("two/x.js"), false),
-                (Path::new("two/y.js"), false),
+                (rel_path(""), false),
+                (rel_path(".gitignore"), false),
+                (rel_path("one"), false),
+                (rel_path("one/node_modules"), true),
+                (rel_path("two"), false),
+                (rel_path("two/x.js"), false),
+                (rel_path("two/y.js"), false),
             ]
         );
     });
@@ -473,7 +470,7 @@ async fn test_open_gitignored_files(cx: &mut TestAppContext) {
     let prev_read_dir_count = fs.read_dir_call_count();
     let loaded = tree
         .update(cx, |tree, cx| {
-            tree.load_file("one/node_modules/b/b1.js".as_ref(), cx)
+            tree.load_file(rel_path("one/node_modules/b/b1.js"), cx)
         })
         .await
         .unwrap();
@@ -484,24 +481,24 @@ async fn test_open_gitignored_files(cx: &mut TestAppContext) {
                 .map(|entry| (entry.path.as_ref(), entry.is_ignored))
                 .collect::<Vec<_>>(),
             vec![
-                (Path::new(""), false),
-                (Path::new(".gitignore"), false),
-                (Path::new("one"), false),
-                (Path::new("one/node_modules"), true),
-                (Path::new("one/node_modules/a"), true),
-                (Path::new("one/node_modules/b"), true),
-                (Path::new("one/node_modules/b/b1.js"), true),
-                (Path::new("one/node_modules/b/b2.js"), true),
-                (Path::new("one/node_modules/c"), true),
-                (Path::new("two"), false),
-                (Path::new("two/x.js"), false),
-                (Path::new("two/y.js"), false),
+                (rel_path(""), false),
+                (rel_path(".gitignore"), false),
+                (rel_path("one"), false),
+                (rel_path("one/node_modules"), true),
+                (rel_path("one/node_modules/a"), true),
+                (rel_path("one/node_modules/b"), true),
+                (rel_path("one/node_modules/b/b1.js"), true),
+                (rel_path("one/node_modules/b/b2.js"), true),
+                (rel_path("one/node_modules/c"), true),
+                (rel_path("two"), false),
+                (rel_path("two/x.js"), false),
+                (rel_path("two/y.js"), false),
             ]
         );
 
         assert_eq!(
             loaded.file.path.as_ref(),
-            Path::new("one/node_modules/b/b1.js")
+            rel_path("one/node_modules/b/b1.js")
         );
 
         // Only the newly-expanded directories are scanned.
@@ -513,7 +510,7 @@ async fn test_open_gitignored_files(cx: &mut TestAppContext) {
     let prev_read_dir_count = fs.read_dir_call_count();
     let loaded = tree
         .update(cx, |tree, cx| {
-            tree.load_file("one/node_modules/a/a2.js".as_ref(), cx)
+            tree.load_file(rel_path("one/node_modules/a/a2.js"), cx)
         })
         .await
         .unwrap();
@@ -524,26 +521,26 @@ async fn test_open_gitignored_files(cx: &mut TestAppContext) {
                 .map(|entry| (entry.path.as_ref(), entry.is_ignored))
                 .collect::<Vec<_>>(),
             vec![
-                (Path::new(""), false),
-                (Path::new(".gitignore"), false),
-                (Path::new("one"), false),
-                (Path::new("one/node_modules"), true),
-                (Path::new("one/node_modules/a"), true),
-                (Path::new("one/node_modules/a/a1.js"), true),
-                (Path::new("one/node_modules/a/a2.js"), true),
-                (Path::new("one/node_modules/b"), true),
-                (Path::new("one/node_modules/b/b1.js"), true),
-                (Path::new("one/node_modules/b/b2.js"), true),
-                (Path::new("one/node_modules/c"), true),
-                (Path::new("two"), false),
-                (Path::new("two/x.js"), false),
-                (Path::new("two/y.js"), false),
+                (rel_path(""), false),
+                (rel_path(".gitignore"), false),
+                (rel_path("one"), false),
+                (rel_path("one/node_modules"), true),
+                (rel_path("one/node_modules/a"), true),
+                (rel_path("one/node_modules/a/a1.js"), true),
+                (rel_path("one/node_modules/a/a2.js"), true),
+                (rel_path("one/node_modules/b"), true),
+                (rel_path("one/node_modules/b/b1.js"), true),
+                (rel_path("one/node_modules/b/b2.js"), true),
+                (rel_path("one/node_modules/c"), true),
+                (rel_path("two"), false),
+                (rel_path("two/x.js"), false),
+                (rel_path("two/y.js"), false),
             ]
         );
 
         assert_eq!(
             loaded.file.path.as_ref(),
-            Path::new("one/node_modules/a/a2.js")
+            rel_path("one/node_modules/a/a2.js")
         );
 
         // Only the newly-expanded directory is scanned.
@@ -607,6 +604,7 @@ async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
         true,
         fs.clone(),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -621,7 +619,7 @@ async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
     tree.read_with(cx, |tree, _| {
         tree.as_local()
             .unwrap()
-            .refresh_entries_for_paths(vec![Path::new("node_modules/d/d.js").into()])
+            .refresh_entries_for_paths(vec![rel_path("node_modules/d/d.js").into()])
     })
     .recv()
     .await;
@@ -633,18 +631,18 @@ async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
                 .map(|e| (e.path.as_ref(), e.is_ignored))
                 .collect::<Vec<_>>(),
             &[
-                (Path::new(""), false),
-                (Path::new(".gitignore"), false),
-                (Path::new("a"), false),
-                (Path::new("a/a.js"), false),
-                (Path::new("b"), false),
-                (Path::new("b/b.js"), false),
-                (Path::new("node_modules"), true),
-                (Path::new("node_modules/c"), true),
-                (Path::new("node_modules/d"), true),
-                (Path::new("node_modules/d/d.js"), true),
-                (Path::new("node_modules/d/e"), true),
-                (Path::new("node_modules/d/f"), true),
+                (rel_path(""), false),
+                (rel_path(".gitignore"), false),
+                (rel_path("a"), false),
+                (rel_path("a/a.js"), false),
+                (rel_path("b"), false),
+                (rel_path("b/b.js"), false),
+                (rel_path("node_modules"), true),
+                (rel_path("node_modules/c"), true),
+                (rel_path("node_modules/d"), true),
+                (rel_path("node_modules/d/d.js"), true),
+                (rel_path("node_modules/d/e"), true),
+                (rel_path("node_modules/d/f"), true),
             ]
         );
     });
@@ -665,23 +663,23 @@ async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
                 .map(|e| (e.path.as_ref(), e.is_ignored))
                 .collect::<Vec<_>>(),
             &[
-                (Path::new(""), false),
-                (Path::new(".gitignore"), false),
-                (Path::new("a"), false),
-                (Path::new("a/a.js"), false),
-                (Path::new("b"), false),
-                (Path::new("b/b.js"), false),
+                (rel_path(""), false),
+                (rel_path(".gitignore"), false),
+                (rel_path("a"), false),
+                (rel_path("a/a.js"), false),
+                (rel_path("b"), false),
+                (rel_path("b/b.js"), false),
                 // This directory is no longer ignored
-                (Path::new("node_modules"), false),
-                (Path::new("node_modules/c"), false),
-                (Path::new("node_modules/c/c.js"), false),
-                (Path::new("node_modules/d"), false),
-                (Path::new("node_modules/d/d.js"), false),
+                (rel_path("node_modules"), false),
+                (rel_path("node_modules/c"), false),
+                (rel_path("node_modules/c/c.js"), false),
+                (rel_path("node_modules/d"), false),
+                (rel_path("node_modules/d/d.js"), false),
                 // This subdirectory is now ignored
-                (Path::new("node_modules/d/e"), true),
-                (Path::new("node_modules/d/f"), false),
-                (Path::new("node_modules/d/f/f1.js"), false),
-                (Path::new("node_modules/d/f/f2.js"), false),
+                (rel_path("node_modules/d/e"), true),
+                (rel_path("node_modules/d/f"), false),
+                (rel_path("node_modules/d/f/f1.js"), false),
+                (rel_path("node_modules/d/f/f2.js"), false),
             ]
         );
     });
@@ -707,6 +705,7 @@ async fn test_write_file(cx: &mut TestAppContext) {
         true,
         Arc::new(RealFs::new(None, cx.executor())),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -722,9 +721,11 @@ async fn test_write_file(cx: &mut TestAppContext) {
     worktree
         .update(cx, |tree, cx| {
             tree.write_file(
-                Path::new("tracked-dir/file.txt"),
+                rel_path("tracked-dir/file.txt").into(),
                 "hello".into(),
                 Default::default(),
+                encoding_rs::UTF_8,
+                false,
                 cx,
             )
         })
@@ -733,18 +734,23 @@ async fn test_write_file(cx: &mut TestAppContext) {
     worktree
         .update(cx, |tree, cx| {
             tree.write_file(
-                Path::new("ignored-dir/file.txt"),
+                rel_path("ignored-dir/file.txt").into(),
                 "world".into(),
                 Default::default(),
+                encoding_rs::UTF_8,
+                false,
                 cx,
             )
         })
         .await
         .unwrap();
-
     worktree.read_with(cx, |tree, _| {
-        let tracked = tree.entry_for_path("tracked-dir/file.txt").unwrap();
-        let ignored = tree.entry_for_path("ignored-dir/file.txt").unwrap();
+        let tracked = tree
+            .entry_for_path(rel_path("tracked-dir/file.txt"))
+            .unwrap();
+        let ignored = tree
+            .entry_for_path(rel_path("ignored-dir/file.txt"))
+            .unwrap();
         assert!(!tracked.is_ignored);
         assert!(ignored.is_ignored);
     });
@@ -764,6 +770,7 @@ async fn test_file_scan_inclusions(cx: &mut TestAppContext) {
             "prettier": {
                 "package.json": "{}",
             },
+            "package.json": "//package.json"
         },
         "src": {
             ".DS_Store": "",
@@ -781,9 +788,9 @@ async fn test_file_scan_inclusions(cx: &mut TestAppContext) {
     }));
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
-            store.update_user_settings::<WorktreeSettings>(cx, |project_settings| {
-                project_settings.file_scan_exclusions = Some(vec![]);
-                project_settings.file_scan_inclusions = Some(vec![
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions = Some(vec![]);
+                settings.project.worktree.file_scan_inclusions = Some(vec![
                     "node_modules/**/package.json".to_string(),
                     "**/.DS_Store".to_string(),
                 ]);
@@ -796,6 +803,7 @@ async fn test_file_scan_inclusions(cx: &mut TestAppContext) {
         true,
         Arc::new(RealFs::new(None, cx.executor())),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -847,9 +855,11 @@ async fn test_file_scan_exclusions_overrules_inclusions(cx: &mut TestAppContext)
 
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
-            store.update_user_settings::<WorktreeSettings>(cx, |project_settings| {
-                project_settings.file_scan_exclusions = Some(vec!["**/.DS_Store".to_string()]);
-                project_settings.file_scan_inclusions = Some(vec!["**/.DS_Store".to_string()]);
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions =
+                    Some(vec!["**/.DS_Store".to_string()]);
+                settings.project.worktree.file_scan_inclusions =
+                    Some(vec!["**/.DS_Store".to_string()]);
             });
         });
     });
@@ -859,6 +869,7 @@ async fn test_file_scan_exclusions_overrules_inclusions(cx: &mut TestAppContext)
         true,
         Arc::new(RealFs::new(None, cx.executor())),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -905,9 +916,10 @@ async fn test_file_scan_inclusions_reindexes_on_setting_change(cx: &mut TestAppC
 
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
-            store.update_user_settings::<WorktreeSettings>(cx, |project_settings| {
-                project_settings.file_scan_exclusions = Some(vec![]);
-                project_settings.file_scan_inclusions = Some(vec!["node_modules/**".to_string()]);
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions = Some(vec![]);
+                settings.project.worktree.file_scan_inclusions =
+                    Some(vec!["node_modules/**".to_string()]);
             });
         });
     });
@@ -916,6 +928,7 @@ async fn test_file_scan_inclusions_reindexes_on_setting_change(cx: &mut TestAppC
         true,
         Arc::new(RealFs::new(None, cx.executor())),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -926,20 +939,20 @@ async fn test_file_scan_inclusions_reindexes_on_setting_change(cx: &mut TestAppC
 
     tree.read_with(cx, |tree, _| {
         assert!(
-            tree.entry_for_path("node_modules")
+            tree.entry_for_path(rel_path("node_modules"))
                 .is_some_and(|f| f.is_always_included)
         );
         assert!(
-            tree.entry_for_path("node_modules/prettier/package.json")
+            tree.entry_for_path(rel_path("node_modules/prettier/package.json"))
                 .is_some_and(|f| f.is_always_included)
         );
     });
 
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
-            store.update_user_settings::<WorktreeSettings>(cx, |project_settings| {
-                project_settings.file_scan_exclusions = Some(vec![]);
-                project_settings.file_scan_inclusions = Some(vec![]);
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions = Some(vec![]);
+                settings.project.worktree.file_scan_inclusions = Some(vec![]);
             });
         });
     });
@@ -949,11 +962,11 @@ async fn test_file_scan_inclusions_reindexes_on_setting_change(cx: &mut TestAppC
 
     tree.read_with(cx, |tree, _| {
         assert!(
-            tree.entry_for_path("node_modules")
+            tree.entry_for_path(rel_path("node_modules"))
                 .is_some_and(|f| !f.is_always_included)
         );
         assert!(
-            tree.entry_for_path("node_modules/prettier/package.json")
+            tree.entry_for_path(rel_path("node_modules/prettier/package.json"))
                 .is_some_and(|f| !f.is_always_included)
         );
     });
@@ -989,8 +1002,8 @@ async fn test_file_scan_exclusions(cx: &mut TestAppContext) {
     }));
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
-            store.update_user_settings::<WorktreeSettings>(cx, |project_settings| {
-                project_settings.file_scan_exclusions =
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions =
                     Some(vec!["**/foo/**".to_string(), "**/.DS_Store".to_string()]);
             });
         });
@@ -1001,6 +1014,7 @@ async fn test_file_scan_exclusions(cx: &mut TestAppContext) {
         true,
         Arc::new(RealFs::new(None, cx.executor())),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -1026,8 +1040,8 @@ async fn test_file_scan_exclusions(cx: &mut TestAppContext) {
 
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
-            store.update_user_settings::<WorktreeSettings>(cx, |project_settings| {
-                project_settings.file_scan_exclusions =
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions =
                     Some(vec!["**/node_modules/**".to_string()]);
             });
         });
@@ -1054,6 +1068,93 @@ async fn test_file_scan_exclusions(cx: &mut TestAppContext) {
             ],
             &[],
         )
+    });
+}
+
+#[gpui::test]
+async fn test_hidden_files(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    let dir = TempTree::new(json!({
+        ".gitignore": "**/target\n",
+        ".hidden_file": "content",
+        ".hidden_dir": {
+            "nested.rs": "code",
+        },
+        "src": {
+            "visible.rs": "code",
+        },
+        "logs": {
+            "app.log": "logs",
+            "debug.log": "logs",
+        },
+        "visible.txt": "content",
+    }));
+
+    let tree = Worktree::local(
+        dir.path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    tree.flush_fs_events(cx).await;
+
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.entries(true, 0)
+                .map(|entry| (entry.path.as_ref(), entry.is_hidden))
+                .collect::<Vec<_>>(),
+            vec![
+                (rel_path(""), false),
+                (rel_path(".gitignore"), true),
+                (rel_path(".hidden_dir"), true),
+                (rel_path(".hidden_dir/nested.rs"), true),
+                (rel_path(".hidden_file"), true),
+                (rel_path("logs"), false),
+                (rel_path("logs/app.log"), false),
+                (rel_path("logs/debug.log"), false),
+                (rel_path("src"), false),
+                (rel_path("src/visible.rs"), false),
+                (rel_path("visible.txt"), false),
+            ]
+        );
+    });
+
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.hidden_files = Some(vec!["**/*.log".to_string()]);
+            });
+        });
+    });
+    tree.flush_fs_events(cx).await;
+    cx.executor().run_until_parked();
+
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.entries(true, 0)
+                .map(|entry| (entry.path.as_ref(), entry.is_hidden))
+                .collect::<Vec<_>>(),
+            vec![
+                (rel_path(""), false),
+                (rel_path(".gitignore"), false),
+                (rel_path(".hidden_dir"), false),
+                (rel_path(".hidden_dir/nested.rs"), false),
+                (rel_path(".hidden_file"), false),
+                (rel_path("logs"), false),
+                (rel_path("logs/app.log"), true),
+                (rel_path("logs/debug.log"), true),
+                (rel_path("src"), false),
+                (rel_path("src/visible.rs"), false),
+                (rel_path("visible.txt"), false),
+            ]
+        );
     });
 }
 
@@ -1091,8 +1192,8 @@ async fn test_fs_events_in_exclusions(cx: &mut TestAppContext) {
     }));
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
-            store.update_user_settings::<WorktreeSettings>(cx, |project_settings| {
-                project_settings.file_scan_exclusions = Some(vec![
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions = Some(vec![
                     "**/.git".to_string(),
                     "node_modules/".to_string(),
                     "build_output".to_string(),
@@ -1106,6 +1207,7 @@ async fn test_fs_events_in_exclusions(cx: &mut TestAppContext) {
         true,
         Arc::new(RealFs::new(None, cx.executor())),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -1217,6 +1319,7 @@ async fn test_fs_events_in_dot_git_worktree(cx: &mut TestAppContext) {
         true,
         Arc::new(RealFs::new(None, cx.executor())),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -1256,6 +1359,7 @@ async fn test_create_directory_during_initial_scan(cx: &mut TestAppContext) {
         true,
         fs,
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -1266,12 +1370,11 @@ async fn test_create_directory_during_initial_scan(cx: &mut TestAppContext) {
         let snapshot = Arc::new(Mutex::new(tree.snapshot()));
         tree.observe_updates(0, cx, {
             let snapshot = snapshot.clone();
-            let settings = tree.settings().clone();
+            let settings = tree.settings();
             move |update| {
                 snapshot
                     .lock()
-                    .apply_remote_update(update, &settings.file_scan_inclusions)
-                    .unwrap();
+                    .apply_remote_update(update, &settings.file_scan_inclusions);
                 async { true }
             }
         });
@@ -1282,17 +1385,20 @@ async fn test_create_directory_during_initial_scan(cx: &mut TestAppContext) {
         .update(cx, |tree, cx| {
             tree.as_local_mut()
                 .unwrap()
-                .create_entry("a/e".as_ref(), true, None, cx)
+                .create_entry(rel_path("a/e").into(), true, None, cx)
         })
         .await
         .unwrap()
-        .to_included()
+        .into_included()
         .unwrap();
     assert!(entry.is_dir());
 
     cx.executor().run_until_parked();
     tree.read_with(cx, |tree, _| {
-        assert_eq!(tree.entry_for_path("a/e").unwrap().kind, EntryKind::Dir);
+        assert_eq!(
+            tree.entry_for_path(rel_path("a/e")).unwrap().kind,
+            EntryKind::Dir
+        );
     });
 
     let snapshot2 = tree.update(cx, |tree, _| tree.as_local().unwrap().snapshot());
@@ -1322,6 +1428,7 @@ async fn test_create_dir_all_on_create_entry(cx: &mut TestAppContext) {
         true,
         fs_fake,
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -1329,21 +1436,28 @@ async fn test_create_dir_all_on_create_entry(cx: &mut TestAppContext) {
 
     let entry = tree_fake
         .update(cx, |tree, cx| {
-            tree.as_local_mut()
-                .unwrap()
-                .create_entry("a/b/c/d.txt".as_ref(), false, None, cx)
+            tree.as_local_mut().unwrap().create_entry(
+                rel_path("a/b/c/d.txt").into(),
+                false,
+                None,
+                cx,
+            )
         })
         .await
         .unwrap()
-        .to_included()
+        .into_included()
         .unwrap();
     assert!(entry.is_file());
 
     cx.executor().run_until_parked();
     tree_fake.read_with(cx, |tree, _| {
-        assert!(tree.entry_for_path("a/b/c/d.txt").unwrap().is_file());
-        assert!(tree.entry_for_path("a/b/c/").unwrap().is_dir());
-        assert!(tree.entry_for_path("a/b/").unwrap().is_dir());
+        assert!(
+            tree.entry_for_path(rel_path("a/b/c/d.txt"))
+                .unwrap()
+                .is_file()
+        );
+        assert!(tree.entry_for_path(rel_path("a/b/c")).unwrap().is_dir());
+        assert!(tree.entry_for_path(rel_path("a/b")).unwrap().is_dir());
     });
 
     let fs_real = Arc::new(RealFs::new(None, cx.executor()));
@@ -1356,6 +1470,7 @@ async fn test_create_dir_all_on_create_entry(cx: &mut TestAppContext) {
         true,
         fs_real,
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -1363,60 +1478,252 @@ async fn test_create_dir_all_on_create_entry(cx: &mut TestAppContext) {
 
     let entry = tree_real
         .update(cx, |tree, cx| {
-            tree.as_local_mut()
-                .unwrap()
-                .create_entry("a/b/c/d.txt".as_ref(), false, None, cx)
+            tree.as_local_mut().unwrap().create_entry(
+                rel_path("a/b/c/d.txt").into(),
+                false,
+                None,
+                cx,
+            )
         })
         .await
         .unwrap()
-        .to_included()
+        .into_included()
         .unwrap();
     assert!(entry.is_file());
 
     cx.executor().run_until_parked();
     tree_real.read_with(cx, |tree, _| {
-        assert!(tree.entry_for_path("a/b/c/d.txt").unwrap().is_file());
-        assert!(tree.entry_for_path("a/b/c/").unwrap().is_dir());
-        assert!(tree.entry_for_path("a/b/").unwrap().is_dir());
+        assert!(
+            tree.entry_for_path(rel_path("a/b/c/d.txt"))
+                .unwrap()
+                .is_file()
+        );
+        assert!(tree.entry_for_path(rel_path("a/b/c")).unwrap().is_dir());
+        assert!(tree.entry_for_path(rel_path("a/b")).unwrap().is_dir());
     });
 
     // Test smallest change
     let entry = tree_real
         .update(cx, |tree, cx| {
-            tree.as_local_mut()
-                .unwrap()
-                .create_entry("a/b/c/e.txt".as_ref(), false, None, cx)
+            tree.as_local_mut().unwrap().create_entry(
+                rel_path("a/b/c/e.txt").into(),
+                false,
+                None,
+                cx,
+            )
         })
         .await
         .unwrap()
-        .to_included()
+        .into_included()
         .unwrap();
     assert!(entry.is_file());
 
     cx.executor().run_until_parked();
     tree_real.read_with(cx, |tree, _| {
-        assert!(tree.entry_for_path("a/b/c/e.txt").unwrap().is_file());
+        assert!(
+            tree.entry_for_path(rel_path("a/b/c/e.txt"))
+                .unwrap()
+                .is_file()
+        );
     });
 
     // Test largest change
     let entry = tree_real
         .update(cx, |tree, cx| {
-            tree.as_local_mut()
-                .unwrap()
-                .create_entry("d/e/f/g.txt".as_ref(), false, None, cx)
+            tree.as_local_mut().unwrap().create_entry(
+                rel_path("d/e/f/g.txt").into(),
+                false,
+                None,
+                cx,
+            )
         })
         .await
         .unwrap()
-        .to_included()
+        .into_included()
         .unwrap();
     assert!(entry.is_file());
 
     cx.executor().run_until_parked();
     tree_real.read_with(cx, |tree, _| {
-        assert!(tree.entry_for_path("d/e/f/g.txt").unwrap().is_file());
-        assert!(tree.entry_for_path("d/e/f").unwrap().is_dir());
-        assert!(tree.entry_for_path("d/e/").unwrap().is_dir());
-        assert!(tree.entry_for_path("d/").unwrap().is_dir());
+        assert!(
+            tree.entry_for_path(rel_path("d/e/f/g.txt"))
+                .unwrap()
+                .is_file()
+        );
+        assert!(tree.entry_for_path(rel_path("d/e/f")).unwrap().is_dir());
+        assert!(tree.entry_for_path(rel_path("d/e")).unwrap().is_dir());
+        assert!(tree.entry_for_path(rel_path("d")).unwrap().is_dir());
+    });
+}
+
+#[gpui::test]
+async fn test_create_file_in_expanded_gitignored_dir(cx: &mut TestAppContext) {
+    // Tests the behavior of our worktree refresh when a file in a gitignored directory
+    // is created.
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".gitignore": "ignored_dir\n",
+            "ignored_dir": {
+                "existing_file.txt": "existing content",
+                "another_file.txt": "another content",
+            },
+        }),
+    )
+    .await;
+
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    tree.read_with(cx, |tree, _| {
+        let ignored_dir = tree.entry_for_path(rel_path("ignored_dir")).unwrap();
+        assert!(ignored_dir.is_ignored);
+        assert_eq!(ignored_dir.kind, EntryKind::UnloadedDir);
+    });
+
+    tree.update(cx, |tree, cx| {
+        tree.load_file(rel_path("ignored_dir/existing_file.txt"), cx)
+    })
+    .await
+    .unwrap();
+
+    tree.read_with(cx, |tree, _| {
+        let ignored_dir = tree.entry_for_path(rel_path("ignored_dir")).unwrap();
+        assert!(ignored_dir.is_ignored);
+        assert_eq!(ignored_dir.kind, EntryKind::Dir);
+
+        assert!(
+            tree.entry_for_path(rel_path("ignored_dir/existing_file.txt"))
+                .is_some()
+        );
+        assert!(
+            tree.entry_for_path(rel_path("ignored_dir/another_file.txt"))
+                .is_some()
+        );
+    });
+
+    let entry = tree
+        .update(cx, |tree, cx| {
+            tree.create_entry(rel_path("ignored_dir/new_file.txt").into(), false, None, cx)
+        })
+        .await
+        .unwrap();
+    assert!(entry.into_included().is_some());
+
+    cx.executor().run_until_parked();
+
+    tree.read_with(cx, |tree, _| {
+        let ignored_dir = tree.entry_for_path(rel_path("ignored_dir")).unwrap();
+        assert!(ignored_dir.is_ignored);
+        assert_eq!(
+            ignored_dir.kind,
+            EntryKind::Dir,
+            "ignored_dir should still be loaded, not UnloadedDir"
+        );
+
+        assert!(
+            tree.entry_for_path(rel_path("ignored_dir/existing_file.txt"))
+                .is_some(),
+            "existing_file.txt should still be visible"
+        );
+        assert!(
+            tree.entry_for_path(rel_path("ignored_dir/another_file.txt"))
+                .is_some(),
+            "another_file.txt should still be visible"
+        );
+        assert!(
+            tree.entry_for_path(rel_path("ignored_dir/new_file.txt"))
+                .is_some(),
+            "new_file.txt should be visible"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_fs_event_for_gitignored_dir_does_not_lose_contents(cx: &mut TestAppContext) {
+    // Tests the behavior of our worktree refresh when a directory modification for a gitignored directory
+    // is triggered.
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".gitignore": "ignored_dir\n",
+            "ignored_dir": {
+                "file1.txt": "content1",
+                "file2.txt": "content2",
+            },
+        }),
+    )
+    .await;
+
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    // Load a file to expand the ignored directory
+    tree.update(cx, |tree, cx| {
+        tree.load_file(rel_path("ignored_dir/file1.txt"), cx)
+    })
+    .await
+    .unwrap();
+
+    tree.read_with(cx, |tree, _| {
+        let ignored_dir = tree.entry_for_path(rel_path("ignored_dir")).unwrap();
+        assert_eq!(ignored_dir.kind, EntryKind::Dir);
+        assert!(
+            tree.entry_for_path(rel_path("ignored_dir/file1.txt"))
+                .is_some()
+        );
+        assert!(
+            tree.entry_for_path(rel_path("ignored_dir/file2.txt"))
+                .is_some()
+        );
+    });
+
+    fs.emit_fs_event("/root/ignored_dir", Some(fs::PathEventKind::Changed));
+    tree.flush_fs_events(cx).await;
+
+    tree.read_with(cx, |tree, _| {
+        let ignored_dir = tree.entry_for_path(rel_path("ignored_dir")).unwrap();
+        assert_eq!(
+            ignored_dir.kind,
+            EntryKind::Dir,
+            "ignored_dir should still be loaded (Dir), not UnloadedDir"
+        );
+        assert!(
+            tree.entry_for_path(rel_path("ignored_dir/file1.txt"))
+                .is_some(),
+            "file1.txt should still be visible after directory fs event"
+        );
+        assert!(
+            tree.entry_for_path(rel_path("ignored_dir/file2.txt"))
+                .is_some(),
+            "file2.txt should still be visible after directory fs event"
+        );
     });
 }
 
@@ -1447,6 +1754,7 @@ async fn test_random_worktree_operations_during_initial_scan(
         true,
         fs.clone(),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -1477,7 +1785,7 @@ async fn test_random_worktree_operations_during_initial_scan(
             tree.as_local().unwrap().snapshot().check_invariants(true)
         });
 
-        if rng.gen_bool(0.6) {
+        if rng.random_bool(0.6) {
             snapshots.push(worktree.read_with(cx, |tree, _| tree.as_local().unwrap().snapshot()));
         }
     }
@@ -1502,15 +1810,14 @@ async fn test_random_worktree_operations_during_initial_scan(
         for update in updates.lock().iter() {
             if update.scan_id >= updated_snapshot.scan_id() as u64 {
                 updated_snapshot
-                    .apply_remote_update(update.clone(), &settings.file_scan_inclusions)
-                    .unwrap();
+                    .apply_remote_update(update.clone(), &settings.file_scan_inclusions);
             }
         }
 
         assert_eq!(
             updated_snapshot.entries(true, 0).collect::<Vec<_>>(),
             final_snapshot.entries(true, 0).collect::<Vec<_>>(),
-            "wrong updates after snapshot {i}: {snapshot:#?} {updates:#?}",
+            "wrong updates after snapshot {i}: {updates:#?}",
         );
     }
 }
@@ -1539,6 +1846,7 @@ async fn test_random_worktree_changes(cx: &mut TestAppContext, mut rng: StdRng) 
         true,
         fs.clone(),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -1565,7 +1873,7 @@ async fn test_random_worktree_changes(cx: &mut TestAppContext, mut rng: StdRng) 
     let mut snapshots = Vec::new();
     let mut mutations_len = operations;
     while mutations_len > 1 {
-        if rng.gen_bool(0.2) {
+        if rng.random_bool(0.2) {
             worktree
                 .update(cx, |worktree, cx| {
                     randomly_mutate_worktree(worktree, &mut rng, cx)
@@ -1577,8 +1885,8 @@ async fn test_random_worktree_changes(cx: &mut TestAppContext, mut rng: StdRng) 
         }
 
         let buffered_event_count = fs.as_fake().buffered_event_count();
-        if buffered_event_count > 0 && rng.gen_bool(0.3) {
-            let len = rng.gen_range(0..=buffered_event_count);
+        if buffered_event_count > 0 && rng.random_bool(0.3) {
+            let len = rng.random_range(0..=buffered_event_count);
             log::info!("flushing {} events", len);
             fs.as_fake().flush_events(len);
         } else {
@@ -1587,7 +1895,7 @@ async fn test_random_worktree_changes(cx: &mut TestAppContext, mut rng: StdRng) 
         }
 
         cx.executor().run_until_parked();
-        if rng.gen_bool(0.2) {
+        if rng.random_bool(0.2) {
             log::info!("storing snapshot {}", snapshots.len());
             let snapshot = worktree.read_with(cx, |tree, _| tree.as_local().unwrap().snapshot());
             snapshots.push(snapshot);
@@ -1611,6 +1919,7 @@ async fn test_random_worktree_changes(cx: &mut TestAppContext, mut rng: StdRng) 
             true,
             fs.clone(),
             Default::default(),
+            true,
             &mut cx.to_async(),
         )
         .await
@@ -1639,9 +1948,7 @@ async fn test_random_worktree_changes(cx: &mut TestAppContext, mut rng: StdRng) 
     for (i, mut prev_snapshot) in snapshots.into_iter().enumerate().rev() {
         for update in updates.lock().iter() {
             if update.scan_id >= prev_snapshot.scan_id() as u64 {
-                prev_snapshot
-                    .apply_remote_update(update.clone(), &settings.file_scan_inclusions)
-                    .unwrap();
+                prev_snapshot.apply_remote_update(update.clone(), &settings.file_scan_inclusions);
             }
         }
 
@@ -1717,39 +2024,15 @@ fn randomly_mutate_worktree(
     let snapshot = worktree.snapshot();
     let entry = snapshot.entries(false, 0).choose(rng).unwrap();
 
-    match rng.gen_range(0_u32..100) {
-        0..=33 if entry.path.as_ref() != Path::new("") => {
+    match rng.random_range(0_u32..100) {
+        0..=33 if entry.path.as_ref() != RelPath::empty() => {
             log::info!("deleting entry {:?} ({})", entry.path, entry.id.0);
             worktree.delete_entry(entry.id, false, cx).unwrap()
         }
-        ..=66 if entry.path.as_ref() != Path::new("") => {
-            let other_entry = snapshot.entries(false, 0).choose(rng).unwrap();
-            let new_parent_path = if other_entry.is_dir() {
-                other_entry.path.clone()
-            } else {
-                other_entry.path.parent().unwrap().into()
-            };
-            let mut new_path = new_parent_path.join(random_filename(rng));
-            if new_path.starts_with(&entry.path) {
-                new_path = random_filename(rng).into();
-            }
-
-            log::info!(
-                "renaming entry {:?} ({}) to {:?}",
-                entry.path,
-                entry.id.0,
-                new_path
-            );
-            let task = worktree.rename_entry(entry.id, new_path, cx);
-            cx.background_spawn(async move {
-                task.await?.to_included().unwrap();
-                Ok(())
-            })
-        }
         _ => {
             if entry.is_dir() {
-                let child_path = entry.path.join(random_filename(rng));
-                let is_dir = rng.gen_bool(0.3);
+                let child_path = entry.path.join(rel_path(&random_filename(rng)));
+                let is_dir = rng.random_bool(0.3);
                 log::info!(
                     "creating {} at {:?}",
                     if is_dir { "dir" } else { "file" },
@@ -1761,9 +2044,15 @@ fn randomly_mutate_worktree(
                     Ok(())
                 })
             } else {
-                log::info!("overwriting file {:?} ({})", entry.path, entry.id.0);
-                let task =
-                    worktree.write_file(entry.path.clone(), "".into(), Default::default(), cx);
+                log::info!("overwriting file {:?} ({})", &entry.path, entry.id.0);
+                let task = worktree.write_file(
+                    entry.path.clone(),
+                    "".into(),
+                    Default::default(),
+                    encoding_rs::UTF_8,
+                    false,
+                    cx,
+                );
                 cx.background_spawn(async move {
                     task.await?;
                     Ok(())
@@ -1793,11 +2082,11 @@ async fn randomly_mutate_fs(
         }
     }
 
-    if (files.is_empty() && dirs.len() == 1) || rng.gen_bool(insertion_probability) {
+    if (files.is_empty() && dirs.len() == 1) || rng.random_bool(insertion_probability) {
         let path = dirs.choose(rng).unwrap();
         let new_path = path.join(random_filename(rng));
 
-        if rng.r#gen() {
+        if rng.random() {
             log::info!(
                 "creating dir {:?}",
                 new_path.strip_prefix(root_path).unwrap()
@@ -1810,9 +2099,9 @@ async fn randomly_mutate_fs(
             );
             fs.create_file(&new_path, Default::default()).await.unwrap();
         }
-    } else if rng.gen_bool(0.05) {
+    } else if rng.random_bool(0.05) {
         let ignore_dir_path = dirs.choose(rng).unwrap();
-        let ignore_path = ignore_dir_path.join(*GITIGNORE);
+        let ignore_path = ignore_dir_path.join(GITIGNORE);
 
         let subdirs = dirs
             .iter()
@@ -1825,11 +2114,11 @@ async fn randomly_mutate_fs(
             .cloned()
             .collect::<Vec<_>>();
         let files_to_ignore = {
-            let len = rng.gen_range(0..=subfiles.len());
+            let len = rng.random_range(0..=subfiles.len());
             subfiles.choose_multiple(rng, len)
         };
         let dirs_to_ignore = {
-            let len = rng.gen_range(0..subdirs.len());
+            let len = rng.random_range(0..subdirs.len());
             subdirs.choose_multiple(rng, len)
         };
 
@@ -1865,7 +2154,7 @@ async fn randomly_mutate_fs(
             file_path.into_iter().chain(dir_path).choose(rng).unwrap()
         };
 
-        let is_rename = rng.r#gen();
+        let is_rename = rng.random();
         if is_rename {
             let new_path_parent = dirs
                 .iter()
@@ -1874,7 +2163,7 @@ async fn randomly_mutate_fs(
                 .unwrap();
 
             let overwrite_existing_dir =
-                !old_path.starts_with(new_path_parent) && rng.gen_bool(0.3);
+                !old_path.starts_with(new_path_parent) && rng.random_bool(0.3);
             let new_path = if overwrite_existing_dir {
                 fs.remove_dir(
                     new_path_parent,
@@ -1906,6 +2195,7 @@ async fn randomly_mutate_fs(
                 fs::RenameOptions {
                     overwrite: true,
                     ignore_if_exists: true,
+                    create_parents: false,
                 },
             )
             .await
@@ -1937,7 +2227,7 @@ async fn randomly_mutate_fs(
 #[cfg(feature = "remote")]
 fn random_filename(rng: &mut impl Rng) -> String {
     (0..6)
-        .map(|_| rng.sample(rand::distributions::Alphanumeric))
+        .map(|_| rng.sample(rand::distr::Alphanumeric))
         .map(char::from)
         .collect()
 }
@@ -1953,6 +2243,7 @@ async fn test_private_single_file_worktree(cx: &mut TestAppContext) {
         true,
         fs.clone(),
         Default::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -1960,46 +2251,9 @@ async fn test_private_single_file_worktree(cx: &mut TestAppContext) {
     cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
         .await;
     tree.read_with(cx, |tree, _| {
-        let entry = tree.entry_for_path("").unwrap();
+        let entry = tree.entry_for_path(rel_path("")).unwrap();
         assert!(entry.is_private);
     });
-}
-
-#[gpui::test]
-fn test_unrelativize() {
-    let work_directory = WorkDirectory::in_project("");
-    pretty_assertions::assert_eq!(
-        work_directory.try_unrelativize(&"crates/gpui/gpui.rs".into()),
-        Some(Path::new("crates/gpui/gpui.rs").into())
-    );
-
-    let work_directory = WorkDirectory::in_project("vendor/some-submodule");
-    pretty_assertions::assert_eq!(
-        work_directory.try_unrelativize(&"src/thing.c".into()),
-        Some(Path::new("vendor/some-submodule/src/thing.c").into())
-    );
-
-    let work_directory = WorkDirectory::AboveProject {
-        absolute_path: Path::new("/projects/vector").into(),
-        location_in_repo: Path::new("crates/gpui").into(),
-    };
-
-    pretty_assertions::assert_eq!(
-        work_directory.try_unrelativize(&"crates/util/util.rs".into()),
-        None,
-    );
-
-    pretty_assertions::assert_eq!(
-        work_directory.unrelativize(&"crates/util/util.rs".into()),
-        Path::new("../util/util.rs").into()
-    );
-
-    pretty_assertions::assert_eq!(work_directory.try_unrelativize(&"README.md".into()), None,);
-
-    pretty_assertions::assert_eq!(
-        work_directory.unrelativize(&"README.md".into()),
-        Path::new("../../README.md").into()
-    );
 }
 
 #[gpui::test]
@@ -2022,6 +2276,7 @@ async fn test_repository_above_root(executor: BackgroundExecutor, cx: &mut TestA
         true,
         fs.clone(),
         Arc::default(),
+        true,
         &mut cx.to_async(),
     )
     .await
@@ -2043,7 +2298,6 @@ async fn test_repository_above_root(executor: BackgroundExecutor, cx: &mut TestA
     });
     pretty_assertions::assert_eq!(repos, [Path::new(path!("/root")).into()]);
 
-    eprintln!(">>>>>>>>>> touch");
     fs.touch_path(path!("/root/subproject")).await;
     worktree
         .update(cx, |worktree, _| {
@@ -2064,6 +2318,206 @@ async fn test_repository_above_root(executor: BackgroundExecutor, cx: &mut TestA
     pretty_assertions::assert_eq!(repos, [Path::new(path!("/root")).into()]);
 }
 
+#[gpui::test]
+async fn test_global_gitignore(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let home = paths::home_dir();
+    let fs = FakeFs::new(executor);
+    fs.insert_tree(
+        home,
+        json!({
+            ".config": {
+                "git": {
+                    "ignore": "foo\n/bar\nbaz\n"
+                }
+            },
+            "project": {
+                ".git": {},
+                ".gitignore": "!baz",
+                "foo": "",
+                "bar": "",
+                "sub": {
+                    "bar": "",
+                },
+                "subrepo": {
+                    ".git": {},
+                    "bar": ""
+                },
+                "baz": ""
+            }
+        }),
+    )
+    .await;
+    let worktree = Worktree::local(
+        home.join("project"),
+        true,
+        fs.clone(),
+        Arc::default(),
+        true,
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    // .gitignore overrides excludesFile, and anchored paths in excludesFile are resolved
+    // relative to the nearest containing repository
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            &[],
+            &["foo", "bar", "subrepo/bar"],
+            &["sub/bar", "baz"],
+            &[],
+        );
+    });
+
+    // Ignore statuses are updated when excludesFile changes
+    fs.write(
+        &home.join(".config").join("git").join("ignore"),
+        "/bar\nbaz\n".as_bytes(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            &[],
+            &["bar", "subrepo/bar"],
+            &["foo", "sub/bar", "baz"],
+            &[],
+        );
+    });
+
+    // Statuses are updated when .git added/removed
+    fs.remove_dir(
+        &home.join("project").join("subrepo").join(".git"),
+        RemoveOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    worktree.update(cx, |worktree, _cx| {
+        check_worktree_entries(
+            worktree,
+            &[],
+            &["bar"],
+            &["foo", "sub/bar", "baz", "subrepo/bar"],
+            &[],
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_repo_exclude(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    let project_dir = Path::new(path!("/project"));
+    fs.insert_tree(
+        project_dir,
+        json!({
+            ".git": {
+                "info": {
+                    "exclude": ".env.*"
+                }
+            },
+            ".env.example": "secret=xxxx",
+            ".env.local": "secret=1234",
+            ".gitignore": "!.env.example",
+            "README.md": "# Repo Exclude",
+            "src": {
+                "main.rs": "fn main() {}",
+            },
+        }),
+    )
+    .await;
+
+    let worktree = Worktree::local(
+        project_dir,
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    // .gitignore overrides .git/info/exclude
+    worktree.update(cx, |worktree, _cx| {
+        let expected_excluded_paths = [];
+        let expected_ignored_paths = [".env.local"];
+        let expected_tracked_paths = [".env.example", "README.md", "src/main.rs"];
+        let expected_included_paths = [];
+
+        check_worktree_entries(
+            worktree,
+            &expected_excluded_paths,
+            &expected_ignored_paths,
+            &expected_tracked_paths,
+            &expected_included_paths,
+        );
+    });
+
+    // Ignore statuses are updated when .git/info/exclude file changes
+    fs.write(
+        &project_dir.join(DOT_GIT).join(REPO_EXCLUDE),
+        ".env.example".as_bytes(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    worktree.update(cx, |worktree, _cx| {
+        let expected_excluded_paths = [];
+        let expected_ignored_paths = [];
+        let expected_tracked_paths = [".env.example", ".env.local", "README.md", "src/main.rs"];
+        let expected_included_paths = [];
+
+        check_worktree_entries(
+            worktree,
+            &expected_excluded_paths,
+            &expected_ignored_paths,
+            &expected_tracked_paths,
+            &expected_included_paths,
+        );
+    });
+}
+
 #[track_caller]
 fn check_worktree_entries(
     tree: &Worktree,
@@ -2073,7 +2527,7 @@ fn check_worktree_entries(
     expected_included_paths: &[&str],
 ) {
     for path in expected_excluded_paths {
-        let entry = tree.entry_for_path(path);
+        let entry = tree.entry_for_path(rel_path(path));
         assert!(
             entry.is_none(),
             "expected path '{path}' to be excluded, but got entry: {entry:?}",
@@ -2081,7 +2535,7 @@ fn check_worktree_entries(
     }
     for path in expected_ignored_paths {
         let entry = tree
-            .entry_for_path(path)
+            .entry_for_path(rel_path(path))
             .unwrap_or_else(|| panic!("Missing entry for expected ignored path '{path}'"));
         assert!(
             entry.is_ignored,
@@ -2090,7 +2544,7 @@ fn check_worktree_entries(
     }
     for path in expected_tracked_paths {
         let entry = tree
-            .entry_for_path(path)
+            .entry_for_path(rel_path(path))
             .unwrap_or_else(|| panic!("Missing entry for expected tracked path '{path}'"));
         assert!(
             !entry.is_ignored || entry.is_always_included,
@@ -2099,7 +2553,7 @@ fn check_worktree_entries(
     }
     for path in expected_included_paths {
         let entry = tree
-            .entry_for_path(path)
+            .entry_for_path(rel_path(path))
             .unwrap_or_else(|| panic!("Missing entry for expected included path '{path}'"));
         assert!(
             entry.is_always_included,
@@ -2114,6 +2568,284 @@ fn init_test(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
-        WorktreeSettings::register(cx);
     });
+}
+
+#[gpui::test]
+async fn test_load_file_encoding(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    struct TestCase {
+        name: &'static str,
+        bytes: Vec<u8>,
+        expected_text: &'static str,
+    }
+
+    // --- Success Cases ---
+    let success_cases = vec![
+        TestCase {
+            name: "utf8.txt",
+            bytes: "こんにちは".as_bytes().to_vec(),
+            expected_text: "こんにちは",
+        },
+        TestCase {
+            name: "sjis.txt",
+            bytes: vec![0x82, 0xb1, 0x82, 0xf1, 0x82, 0xc9, 0x82, 0xbf, 0x82, 0xcd],
+            expected_text: "こんにちは",
+        },
+        TestCase {
+            name: "eucjp.txt",
+            bytes: vec![0xa4, 0xb3, 0xa4, 0xf3, 0xa4, 0xcb, 0xa4, 0xc1, 0xa4, 0xcf],
+            expected_text: "こんにちは",
+        },
+        TestCase {
+            name: "iso2022jp.txt",
+            bytes: vec![
+                0x1b, 0x24, 0x42, 0x24, 0x33, 0x24, 0x73, 0x24, 0x4b, 0x24, 0x41, 0x24, 0x4f, 0x1b,
+                0x28, 0x42,
+            ],
+            expected_text: "こんにちは",
+        },
+        TestCase {
+            name: "win1252.txt",
+            bytes: vec![0x43, 0x61, 0x66, 0xe9],
+            expected_text: "Café",
+        },
+        TestCase {
+            name: "gbk.txt",
+            bytes: vec![
+                0xbd, 0xf1, 0xcc, 0xec, 0xcc, 0xec, 0xc6, 0xf8, 0xb2, 0xbb, 0xb4, 0xed,
+            ],
+            expected_text: "今天天气不错",
+        },
+        // UTF-16LE with BOM
+        TestCase {
+            name: "utf16le_bom.txt",
+            bytes: vec![
+                0xFF, 0xFE, // BOM
+                0x53, 0x30, 0x93, 0x30, 0x6B, 0x30, 0x61, 0x30, 0x6F, 0x30,
+            ],
+            expected_text: "こんにちは",
+        },
+        // UTF-16BE with BOM
+        TestCase {
+            name: "utf16be_bom.txt",
+            bytes: vec![
+                0xFE, 0xFF, // BOM
+                0x30, 0x53, 0x30, 0x93, 0x30, 0x6B, 0x30, 0x61, 0x30, 0x6F,
+            ],
+            expected_text: "こんにちは",
+        },
+        // UTF-16LE without BOM (ASCII only)
+        // This relies on the "null byte heuristic" we implemented.
+        // "ABC" -> 41 00 42 00 43 00
+        TestCase {
+            name: "utf16le_ascii_no_bom.txt",
+            bytes: vec![0x41, 0x00, 0x42, 0x00, 0x43, 0x00],
+            expected_text: "ABC",
+        },
+    ];
+
+    // --- Failure Cases ---
+    let failure_cases = vec![
+        // Binary File (Should be detected by heuristic and return Error)
+        // Contains random bytes and mixed nulls that don't match UTF-16 patterns
+        TestCase {
+            name: "binary.bin",
+            bytes: vec![0x00, 0xFF, 0x12, 0x00, 0x99, 0x88, 0x77, 0x66, 0x00],
+            expected_text: "", // Not used
+        },
+    ];
+
+    let root_path = if cfg!(windows) {
+        Path::new("C:\\root")
+    } else {
+        Path::new("/root")
+    };
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.create_dir(root_path).await.unwrap();
+
+    for case in success_cases.iter().chain(failure_cases.iter()) {
+        let path = root_path.join(case.name);
+        fs.write(&path, &case.bytes).await.unwrap();
+    }
+
+    let tree = Worktree::local(
+        root_path,
+        true,
+        fs,
+        Default::default(),
+        true,
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    let rel_path = |name: &str| {
+        RelPath::new(&Path::new(name), PathStyle::local())
+            .unwrap()
+            .into_arc()
+    };
+
+    // Run Success Tests
+    for case in success_cases {
+        let loaded = tree
+            .update(cx, |tree, cx| tree.load_file(&rel_path(case.name), cx))
+            .await;
+        if let Err(e) = &loaded {
+            panic!("Failed to load success case '{}': {:?}", case.name, e);
+        }
+        let loaded = loaded.unwrap();
+        assert_eq!(
+            loaded.text, case.expected_text,
+            "Encoding mismatch for file: {}",
+            case.name
+        );
+    }
+
+    // Run Failure Tests
+    for case in failure_cases {
+        let loaded = tree
+            .update(cx, |tree, cx| tree.load_file(&rel_path(case.name), cx))
+            .await;
+        assert!(
+            loaded.is_err(),
+            "Failure case '{}' unexpectedly succeeded! It should have been detected as binary.",
+            case.name
+        );
+        let err_msg = loaded.unwrap_err().to_string();
+        println!("Got expected error for {}: {}", case.name, err_msg);
+    }
+}
+
+#[gpui::test]
+async fn test_write_file_encoding(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    let root_path = if cfg!(windows) {
+        Path::new("C:\\root")
+    } else {
+        Path::new("/root")
+    };
+    fs.create_dir(root_path).await.unwrap();
+
+    let worktree = Worktree::local(
+        root_path,
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    // Define test case structure
+    struct TestCase {
+        name: &'static str,
+        text: &'static str,
+        encoding: &'static encoding_rs::Encoding,
+        has_bom: bool,
+        expected_bytes: Vec<u8>,
+    }
+
+    let cases = vec![
+        // Shift_JIS with Japanese
+        TestCase {
+            name: "Shift_JIS with Japanese",
+            text: "こんにちは",
+            encoding: encoding_rs::SHIFT_JIS,
+            has_bom: false,
+            expected_bytes: vec![0x82, 0xb1, 0x82, 0xf1, 0x82, 0xc9, 0x82, 0xbf, 0x82, 0xcd],
+        },
+        // UTF-8 No BOM
+        TestCase {
+            name: "UTF-8 No BOM",
+            text: "AB",
+            encoding: encoding_rs::UTF_8,
+            has_bom: false,
+            expected_bytes: vec![0x41, 0x42],
+        },
+        // UTF-8 with BOM
+        TestCase {
+            name: "UTF-8 with BOM",
+            text: "AB",
+            encoding: encoding_rs::UTF_8,
+            has_bom: true,
+            expected_bytes: vec![0xEF, 0xBB, 0xBF, 0x41, 0x42],
+        },
+        // UTF-16LE No BOM with Japanese
+        // NOTE: This passes thanks to the manual encoding fix implemented in `write_file`.
+        TestCase {
+            name: "UTF-16LE No BOM with Japanese",
+            text: "こんにちは",
+            encoding: encoding_rs::UTF_16LE,
+            has_bom: false,
+            expected_bytes: vec![0x53, 0x30, 0x93, 0x30, 0x6b, 0x30, 0x61, 0x30, 0x6f, 0x30],
+        },
+        // UTF-16LE with BOM
+        TestCase {
+            name: "UTF-16LE with BOM",
+            text: "A",
+            encoding: encoding_rs::UTF_16LE,
+            has_bom: true,
+            expected_bytes: vec![0xFF, 0xFE, 0x41, 0x00],
+        },
+        // UTF-16BE No BOM with Japanese
+        // NOTE: This passes thanks to the manual encoding fix.
+        TestCase {
+            name: "UTF-16BE No BOM with Japanese",
+            text: "こんにちは",
+            encoding: encoding_rs::UTF_16BE,
+            has_bom: false,
+            expected_bytes: vec![0x30, 0x53, 0x30, 0x93, 0x30, 0x6b, 0x30, 0x61, 0x30, 0x6f],
+        },
+        // UTF-16BE with BOM
+        TestCase {
+            name: "UTF-16BE with BOM",
+            text: "A",
+            encoding: encoding_rs::UTF_16BE,
+            has_bom: true,
+            expected_bytes: vec![0xFE, 0xFF, 0x00, 0x41],
+        },
+    ];
+
+    for (i, case) in cases.into_iter().enumerate() {
+        let file_name = format!("test_{}.txt", i);
+        let path: Arc<Path> = Path::new(&file_name).into();
+        let file_path = root_path.join(&file_name);
+
+        fs.insert_file(&file_path, "".into()).await;
+
+        let rel_path = RelPath::new(&path, PathStyle::local()).unwrap().into_arc();
+        let text = text::Rope::from(case.text);
+
+        let task = worktree.update(cx, |wt, cx| {
+            wt.write_file(
+                rel_path,
+                text,
+                text::LineEnding::Unix,
+                case.encoding,
+                case.has_bom,
+                cx,
+            )
+        });
+
+        if let Err(e) = task.await {
+            panic!("Unexpected error in case '{}': {:?}", case.name, e);
+        }
+
+        let bytes = fs.load_bytes(&file_path).await.unwrap();
+
+        assert_eq!(
+            bytes, case.expected_bytes,
+            "case '{}' mismatch. Expected {:?}, but got {:?}",
+            case.name, case.expected_bytes, bytes
+        );
+    }
 }

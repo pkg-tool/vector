@@ -10,10 +10,9 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Install Rust
-      shell: pwsh
+    - name: Install test runner
       working-directory: ${{ inputs.working-directory }}
-      run: cargo install cargo-nextest --locked
+      uses: taiki-e/install-action@nextest
 
     - name: Install Node
       uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -21,6 +20,7 @@ runs:
         node-version: "18"
 
     - name: Run tests
-      shell: pwsh
+      shell: powershell
       working-directory: ${{ inputs.working-directory }}
-      run: cargo nextest run --workspace --no-fail-fast --config='profile.dev.debug="limited"'
+      run: |
+        cargo nextest run --workspace --no-fail-fast --failure-output immediate-final

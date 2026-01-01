@@ -1,21 +1,29 @@
 use std::sync::Arc;
 
+use gpui::Transformation;
 use gpui::{App, IntoElement, Rems, RenderOnce, Size, Styled, Window, svg};
 use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString, IntoStaticStr};
 
 use crate::Color;
 use crate::prelude::*;
+use crate::traits::transformable::Transformable;
 
 #[derive(
     Debug, PartialEq, Eq, Copy, Clone, EnumIter, EnumString, IntoStaticStr, Serialize, Deserialize,
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum VectorName {
-    VectorLogo,
-    VectorXCopilot,
-    Grid,
+    AcpGrid,
+    AcpLogo,
+    AcpLogoSerif,
     AiGrid,
+    DebuggerGrid,
+    Grid,
+    ProTrialStamp,
+    ProUserStamp,
+    ZedLogo,
+    ZedXCopilot,
 }
 
 impl VectorName {
@@ -36,6 +44,7 @@ pub struct Vector {
     path: Arc<str>,
     color: Color,
     size: Size<Rems>,
+    transformation: Transformation,
 }
 
 impl Vector {
@@ -45,6 +54,7 @@ impl Vector {
             path: vector.path(),
             color: Color::default(),
             size: Size { width, height },
+            transformation: Transformation::default(),
         }
     }
 
@@ -67,6 +77,13 @@ impl Vector {
     }
 }
 
+impl Transformable for Vector {
+    fn transform(mut self, transformation: Transformation) -> Self {
+        self.transformation = transformation;
+        self
+    }
+}
+
 impl RenderOnce for Vector {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let width = self.size.width;
@@ -80,6 +97,7 @@ impl RenderOnce for Vector {
             .h(height)
             .path(self.path)
             .text_color(self.color.color(cx))
+            .with_transformation(self.transformation)
     }
 }
 
@@ -97,6 +115,8 @@ impl Component for Vector {
     }
 
     fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
+        let size = rems_from_px(60.);
+
         Some(
             v_flex()
                 .gap_6()
@@ -106,11 +126,18 @@ impl Component for Vector {
                         vec![
                             single_example(
                                 "Default",
-                                Vector::square(VectorName::VectorLogo, rems(8.)).into_any_element(),
+                                Vector::square(VectorName::ZedLogo, size).into_any_element(),
                             ),
                             single_example(
                                 "Custom Size",
-                                Vector::new(VectorName::VectorLogo, rems(12.), rems(6.))
+                                h_flex()
+                                    .h(rems_from_px(120.))
+                                    .justify_center()
+                                    .child(Vector::new(
+                                        VectorName::ZedLogo,
+                                        rems_from_px(120.),
+                                        rems_from_px(200.),
+                                    ))
                                     .into_any_element(),
                             ),
                         ],
@@ -120,13 +147,13 @@ impl Component for Vector {
                         vec![
                             single_example(
                                 "Accent Color",
-                                Vector::square(VectorName::VectorLogo, rems(8.))
+                                Vector::square(VectorName::ZedLogo, size)
                                     .color(Color::Accent)
                                     .into_any_element(),
                             ),
                             single_example(
                                 "Error Color",
-                                Vector::square(VectorName::VectorLogo, rems(8.))
+                                Vector::square(VectorName::ZedLogo, size)
                                     .color(Color::Error)
                                     .into_any_element(),
                             ),
@@ -134,17 +161,11 @@ impl Component for Vector {
                     ),
                     example_group_with_title(
                         "Different Vectors",
-                        vec![
-                            single_example(
-                                "Vector Logo",
-                                Vector::square(VectorName::VectorLogo, rems(8.)).into_any_element(),
-                            ),
-                            single_example(
-                                "Vector X Copilot",
-                                Vector::square(VectorName::VectorXCopilot, rems(8.))
-                                    .into_any_element(),
-                            ),
-                        ],
+                        vec![single_example(
+                            "Zed X Copilot",
+                            Vector::square(VectorName::ZedXCopilot, rems_from_px(100.))
+                                .into_any_element(),
+                        )],
                     ),
                 ])
                 .into_any_element(),

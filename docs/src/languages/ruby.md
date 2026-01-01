@@ -9,6 +9,8 @@ Ruby support is available through the [Ruby extension](https://github.com/vector
   - [ruby-lsp](https://github.com/Shopify/ruby-lsp)
   - [solargraph](https://github.com/castwide/solargraph)
   - [rubocop](https://github.com/rubocop/rubocop)
+  - [Herb](https://herb-tools.dev)
+- Debug Adapter: [`rdbg`](https://github.com/ruby/debug)
 
 The Ruby extension also provides support for ERB files.
 
@@ -21,7 +23,12 @@ There are multiple language servers available for Ruby. Vector supports the two 
 
 They both have an overlapping feature set of autocomplete, diagnostics, code actions, etc. and it's up to you to decide which one you want to use. Note that you can't use both at the same time.
 
-In addition to these two language servers, Vector also supports [rubocop](https://github.com/rubocop/rubocop) which is a static code analyzer and linter for Ruby. Under the hood, it's also used by Vector as a language server, but its functionality is complimentary to that of solargraph and ruby-lsp.
+In addition to these two language servers, Zed also supports:
+
+- [rubocop](https://github.com/rubocop/rubocop) which is a static code analyzer and linter for Ruby. Under the hood, it's also used by Zed as a language server, but its functionality is complimentary to that of solargraph and ruby-lsp.
+- [sorbet](https://sorbet.org/) which is a static type checker for Ruby with a custom gradual type system.
+- [steep](https://github.com/soutaro/steep) which is a static type checker for Ruby that leverages Ruby Signature (RBS).
+- [Herb](https://herb-tools.dev) which is a language server for ERB files.
 
 When configuring a language server, it helps to open the LSP Logs window using the 'dev: Open Language Server Logs' command. You can then choose the corresponding language instance to see any logged information.
 
@@ -31,7 +38,7 @@ The [Ruby extension](https://github.com/vector-extensions/ruby) offers both `sol
 
 ### Language Server Activation
 
-For all Ruby language servers (`solargraph`, `ruby-lsp`, and `rubocop`), the Ruby extension follows this activation sequence:
+For all supported Ruby language servers (`solargraph`, `ruby-lsp`, `rubocop`, `sorbet`, and `steep`), the Ruby extension follows this activation sequence:
 
 1. If the language server is found in your project's `Gemfile`, it will be used through `bundle exec`.
 2. If not found in the `Gemfile`, the Ruby extension will look for the executable in your system `PATH`.
@@ -39,15 +46,15 @@ For all Ruby language servers (`solargraph`, `ruby-lsp`, and `rubocop`), the Rub
 
 You can skip step 1 and force using the system executable by setting `use_bundler` to `false` in your settings:
 
-```jsonc
+```json [settings]
 {
   "lsp": {
     "<SERVER_NAME>": {
       "settings": {
-        "use_bundler": false,
-      },
-    },
-  },
+        "use_bundler": false
+      }
+    }
+  }
 }
 ```
 
@@ -59,11 +66,23 @@ You can skip step 1 and force using the system executable by setting `use_bundle
 
 To switch to `ruby-lsp`, add the following to your `settings.json`:
 
-```json
+```json [settings]
 {
   "languages": {
     "Ruby": {
       "language_servers": ["ruby-lsp", "!solargraph", "!rubocop", "..."]
+    },
+    // Enable herb and ruby-lsp for *.html.erb files
+    "HTML+ERB": {
+      "language_servers": ["herb", "ruby-lsp", "..."]
+    },
+    // Enable ruby-lsp for *.js.erb files
+    "JS+ERB": {
+      "language_servers": ["ruby-lsp", "..."]
+    },
+    // Enable ruby-lsp for *.yaml.erb files
+    "YAML+ERB": {
+      "language_servers": ["ruby-lsp", "..."]
     }
   }
 }
@@ -77,7 +96,7 @@ The Ruby extension also provides support for `rubocop` language server for offen
 
 To enable it, add the following to your `settings.json`:
 
-```json
+```json [settings]
 {
   "languages": {
     "Ruby": {
@@ -89,7 +108,7 @@ To enable it, add the following to your `settings.json`:
 
 Or, conversely, you can disable `ruby-lsp` and enable `solargraph` and `rubocop` by adding the following to your `settings.json`:
 
-```json
+```json [settings]
 {
   "languages": {
     "Ruby": {
@@ -103,7 +122,7 @@ Or, conversely, you can disable `ruby-lsp` and enable `solargraph` and `rubocop`
 
 Solargraph has formatting and diagnostics disabled by default. We can tell Vector to enable them by adding the following to your `settings.json`:
 
-```json
+```json [settings]
 {
   "lsp": {
     "solargraph": {
@@ -122,9 +141,9 @@ Solargraph reads its configuration from a file called `.solargraph.yml` in the r
 
 ## Setting up `ruby-lsp`
 
-Ruby LSP uses pull-based diagnostics which Vector doesn't support yet. We can tell Vector to disable it by adding the following to your `settings.json`:
+You can pass Ruby LSP configuration to `initialization_options`, e.g.
 
-```json
+```json [settings]
 {
   "languages": {
     "Ruby": {
@@ -135,8 +154,7 @@ Ruby LSP uses pull-based diagnostics which Vector doesn't support yet. We can te
     "ruby-lsp": {
       "initialization_options": {
         "enabledFeatures": {
-          // This disables diagnostics
-          "diagnostics": false
+          // "someFeature": false
         }
       }
     }
@@ -146,7 +164,7 @@ Ruby LSP uses pull-based diagnostics which Vector doesn't support yet. We can te
 
 LSP `settings` and `initialization_options` can also be project-specific. For example to use [standardrb/standard](https://github.com/standardrb/standard) as a formatter and linter for a particular project, add this to a `.vector/settings.json` inside your project repo:
 
-```json
+```json [settings]
 {
   "lsp": {
     "ruby-lsp": {
@@ -163,7 +181,7 @@ LSP `settings` and `initialization_options` can also be project-specific. For ex
 
 Rubocop has unsafe autocorrection disabled by default. We can tell Vector to enable it by adding the following to your `settings.json`:
 
-```json
+```json [settings]
 {
   "languages": {
     "Ruby": {
@@ -188,26 +206,65 @@ Rubocop has unsafe autocorrection disabled by default. We can tell Vector to ena
 }
 ```
 
-## Using the Tailwind CSS Language Server with Ruby
+## Setting up Sorbet
 
-It's possible to use the [Tailwind CSS Language Server](https://github.com/tailwindlabs/tailwindcss-intellisense/tree/HEAD/packages/tailwindcss-language-server#readme) in Ruby and ERB files.
+[Sorbet](https://sorbet.org/) is a popular static type checker for Ruby that includes a language server.
 
-In order to do that, you need to configure the language server so that it knows about where to look for CSS classes in Ruby/ERB files by adding the following to your `settings.json`:
+To enable Sorbet, add `\"sorbet\"` to the `language_servers` list for Ruby in your `settings.json`. You may want to disable other language servers if Sorbet is intended to be your primary LSP, or if you plan to use it alongside another LSP for specific features like type checking.
 
-```json
+```json [settings]
 {
   "languages": {
     "Ruby": {
-      "language_servers": ["tailwindcss-language-server", "..."]
+      "language_servers": [
+        "ruby-lsp",
+        "sorbet",
+        "!rubocop",
+        "!solargraph",
+        "..."
+      ]
     }
-  },
+  }
+}
+```
+
+For all aspects of installing Sorbet, setting it up in your project, and configuring its behavior, please refer to the [official Sorbet documentation](https://sorbet.org/docs/overview).
+
+## Setting up Steep
+
+[Steep](https://github.com/soutaro/steep) is a static type checker for Ruby that uses RBS files to define types.
+
+To enable Steep, add `\"steep\"` to the `language_servers` list for Ruby in your `settings.json`. You may need to adjust the order or disable other LSPs depending on your desired setup.
+
+```json [settings]
+{
+  "languages": {
+    "Ruby": {
+      "language_servers": [
+        "ruby-lsp",
+        "steep",
+        "!solargraph",
+        "!rubocop",
+        "..."
+      ]
+    }
+  }
+}
+```
+
+## Setting up Herb
+
+`Herb` is enabled by default for the `HTML+ERB` language.
+
+## Using the Tailwind CSS Language Server with Ruby
+
+To get all the features (autocomplete, linting, etc.) from the [Tailwind CSS language server](https://github.com/tailwindlabs/tailwindcss-intellisense/tree/HEAD/packages/tailwindcss-language-server#readme) in Ruby/ERB files, you need to configure the language server so that it knows about where to look for CSS classes by adding the following to your `settings.json`:
+
+```json [settings]
+{
   "lsp": {
     "tailwindcss-language-server": {
       "settings": {
-        "includeLanguages": {
-          "erb": "html",
-          "ruby": "html"
-        },
         "experimental": {
           "classRegex": ["\\bclass:\\s*['\"]([^'\"]*)['\"]"]
         }
@@ -217,7 +274,7 @@ In order to do that, you need to configure the language server so that it knows 
 }
 ```
 
-With these settings you will get completions for Tailwind CSS classes in HTML attributes inside ERB files and inside Ruby/ERB strings that are coming after a `class:` key. Examples:
+With these settings, you will get completions for Tailwind CSS classes in HTML attributes inside ERB files and inside Ruby/ERB strings that are coming after a `class:` key. Examples:
 
 ```rb
 # Ruby file:
@@ -238,28 +295,41 @@ To run tests in your Ruby project, you can set up custom tasks in your local `.v
 
 ### Minitest with Rails
 
-```json
+```json [tasks]
 [
   {
-    "label": "test $VECTOR_RELATIVE_FILE -n /$VECTOR_SYMBOL/",
-    "command": "bin/rails test $VECTOR_RELATIVE_FILE -n /$VECTOR_SYMBOL/",
+    "label": "test $ZED_RELATIVE_FILE -n /$ZED_CUSTOM_RUBY_TEST_NAME/",
+    "command": "bin/rails",
+    "args": [
+      "test",
+      "$ZED_RELATIVE_FILE",
+      "-n",
+      "\"$ZED_CUSTOM_RUBY_TEST_NAME\""
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
     "tags": ["ruby-test"]
   }
 ]
 ```
 
-Note: We can't use `args` here because of the way quotes are handled.
-
 ### Minitest
 
-Plain minitest does not support running tests by line number, only by name, so we need to use `$VECTOR_SYMBOL` instead:
+Plain minitest does not support running tests by line number, only by name, so we need to use `$ZED_CUSTOM_RUBY_TEST_NAME` instead:
 
-```json
+```json [tasks]
 [
   {
-    "label": "-Itest $VECTOR_RELATIVE_FILE -n /$VECTOR_SYMBOL/",
-    "command": "bundle exec ruby",
-    "args": ["-Itest", "$VECTOR_RELATIVE_FILE", "-n /$VECTOR_SYMBOL/"],
+    "label": "-Itest $ZED_RELATIVE_FILE -n /$ZED_CUSTOM_RUBY_TEST_NAME/",
+    "command": "bundle",
+    "args": [
+      "exec",
+      "ruby",
+      "-Itest",
+      "$ZED_RELATIVE_FILE",
+      "-n",
+      "\"$ZED_CUSTOM_RUBY_TEST_NAME\""
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
     "tags": ["ruby-test"]
   }
 ]
@@ -267,39 +337,73 @@ Plain minitest does not support running tests by line number, only by name, so w
 
 ### RSpec
 
-```json
+```json [tasks]
 [
   {
-    "label": "test $VECTOR_RELATIVE_FILE:$VECTOR_ROW",
-    "command": "bundle exec rspec",
-    "args": ["\"$VECTOR_RELATIVE_FILE:$VECTOR_ROW\""],
+    "label": "test $ZED_RELATIVE_FILE:$ZED_ROW",
+    "command": "bundle",
+    "args": ["exec", "rspec", "\"$ZED_RELATIVE_FILE:$ZED_ROW\""],
+    "cwd": "$ZED_WORKTREE_ROOT",
     "tags": ["ruby-test"]
   }
 ]
 ```
 
-### quickdraw
+Similar task syntax can be used for other test frameworks such as `quickdraw` or `tldr`.
 
-```json
+## Debugging
+
+The Ruby extension provides a debug adapter for debugging Ruby code. Zed's name for the adapter (in the UI and `debug.json`) is `rdbg`, and under the hood, it uses the [`debug`](https://github.com/ruby/debug) gem. The extension uses the [same activation logic](#language-server-activation) as the language servers.
+
+### Examples
+
+#### Debug a Ruby script
+
+```json [debug]
 [
   {
-    "label": "test $VECTOR_RELATIVE_FILE:$VECTOR_ROW",
-    "command": "bundle exec qt",
-    "args": ["\"$VECTOR_RELATIVE_FILE:$VECTOR_ROW\""],
-    "tags": ["ruby-test"]
+    "label": "Debug current file",
+    "adapter": "rdbg",
+    "request": "launch",
+    "script": "$ZED_FILE",
+    "cwd": "$ZED_WORKTREE_ROOT"
   }
 ]
 ```
 
-### tldr
+#### Debug Rails server
 
-```json
+```json [debug]
 [
   {
-    "label": "test $VECTOR_RELATIVE_FILE:$VECTOR_ROW",
-    "command": "bundle exec tldr",
-    "args": ["\"$VECTOR_RELATIVE_FILE:$VECTOR_ROW\""],
-    "tags": ["ruby-test"]
+    "label": "Debug Rails server",
+    "adapter": "rdbg",
+    "request": "launch",
+    "command": "./bin/rails",
+    "args": ["server"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUBY_DEBUG_OPEN": "true"
+    }
   }
 ]
+```
+
+## Formatters
+
+### `erb-formatter`
+
+To format ERB templates, you can use the `erb-formatter` formatter. This formatter uses the [`erb-formatter`](https://rubygems.org/gems/erb-formatter) gem to format ERB templates.
+
+```json [settings]
+{
+  "HTML+ERB": {
+    "formatter": {
+      "external": {
+        "command": "erb-formatter",
+        "arguments": ["--stdin-filename", "{buffer_path}"]
+      }
+    }
+  }
+}
 ```

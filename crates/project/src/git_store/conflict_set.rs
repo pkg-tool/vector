@@ -1,4 +1,4 @@
-use gpui::{App, Context, Entity, EventEmitter};
+use gpui::{App, Context, Entity, EventEmitter, SharedString};
 use std::{cmp::Ordering, ops::Range, sync::Arc};
 use text::{Anchor, BufferId, OffsetRangeExt as _};
 
@@ -72,13 +72,15 @@ impl ConflictSetSnapshot {
             (None, None) => None,
             (None, Some(conflict)) => Some(conflict.range.start),
             (Some(conflict), None) => Some(conflict.range.start),
-            (Some(first), Some(second)) => Some(first.range.start.min(&second.range.start, buffer)),
+            (Some(first), Some(second)) => {
+                Some(*first.range.start.min(&second.range.start, buffer))
+            }
         };
         let end = match (old_conflicts.last(), new_conflicts.last()) {
             (None, None) => None,
             (None, Some(conflict)) => Some(conflict.range.end),
             (Some(first), None) => Some(first.range.end),
-            (Some(first), Some(second)) => Some(first.range.end.max(&second.range.end, buffer)),
+            (Some(first), Some(second)) => Some(*first.range.end.max(&second.range.end, buffer)),
         };
         ConflictSetUpdate {
             buffer_range: start.zip(end).map(|(start, end)| start..end),
@@ -90,6 +92,8 @@ impl ConflictSetSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictRegion {
+    pub ours_branch_name: SharedString,
+    pub theirs_branch_name: SharedString,
     pub range: Range<Anchor>,
     pub ours: Range<Anchor>,
     pub theirs: Range<Anchor>,
@@ -171,23 +175,31 @@ impl ConflictSet {
         let mut conflicts = Vec::new();
 
         let mut line_pos = 0;
-        let mut lines = buffer.text_for_range(0..buffer.len()).lines();
+        let buffer_len = buffer.len();
+        let mut lines = buffer.text_for_range(0..buffer_len).lines();
 
         let mut conflict_start: Option<usize> = None;
         let mut ours_start: Option<usize> = None;
         let mut ours_end: Option<usize> = None;
+        let mut ours_branch_name: Option<SharedString> = None;
         let mut base_start: Option<usize> = None;
         let mut base_end: Option<usize> = None;
         let mut theirs_start: Option<usize> = None;
+        let mut theirs_branch_name: Option<SharedString> = None;
 
         while let Some(line) = lines.next() {
             let line_end = line_pos + line.len();
 
-            if line.starts_with("<<<<<<< ") {
+            if let Some(branch_name) = line.strip_prefix("<<<<<<< ") {
                 // If we see a new conflict marker while already parsing one,
                 // abandon the previous one and start a new one
                 conflict_start = Some(line_pos);
                 ours_start = Some(line_end + 1);
+
+                let branch_name = branch_name.trim();
+                if !branch_name.is_empty() {
+                    ours_branch_name = Some(SharedString::new(branch_name));
+                }
             } else if line.starts_with("||||||| ")
                 && conflict_start.is_some()
                 && ours_start.is_some()
@@ -205,14 +217,19 @@ impl ConflictSet {
                     base_end = Some(line_pos);
                 }
                 theirs_start = Some(line_end + 1);
-            } else if line.starts_with(">>>>>>> ")
+            } else if let Some(branch_name) = line.strip_prefix(">>>>>>> ")
                 && conflict_start.is_some()
                 && ours_start.is_some()
                 && ours_end.is_some()
                 && theirs_start.is_some()
             {
+                let branch_name = branch_name.trim();
+                if !branch_name.is_empty() {
+                    theirs_branch_name = Some(SharedString::new(branch_name));
+                }
+
                 let theirs_end = line_pos;
-                let conflict_end = line_end + 1;
+                let conflict_end = (line_end + 1).min(buffer_len);
 
                 let range = buffer.anchor_after(conflict_start.unwrap())
                     ..buffer.anchor_before(conflict_end);
@@ -226,6 +243,12 @@ impl ConflictSet {
                     .map(|(start, end)| buffer.anchor_after(start)..buffer.anchor_before(end));
 
                 conflicts.push(ConflictRegion {
+                    ours_branch_name: ours_branch_name
+                        .take()
+                        .unwrap_or_else(|| SharedString::new_static("HEAD")),
+                    theirs_branch_name: theirs_branch_name
+                        .take()
+                        .unwrap_or_else(|| SharedString::new_static("Origin")),
                     range,
                     ours,
                     theirs,
@@ -254,21 +277,21 @@ impl EventEmitter<ConflictSetUpdate> for ConflictSet {}
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::mpsc};
+    use std::sync::mpsc;
 
-    use crate::{Project, project_settings::ProjectSettings};
+    use crate::Project;
 
     use super::*;
     use fs::FakeFs;
-    use git::status::{UnmergedStatus, UnmergedStatusCode};
+    use git::{
+        repository::{RepoPath, repo_path},
+        status::{UnmergedStatus, UnmergedStatusCode},
+    };
     use gpui::{BackgroundExecutor, TestAppContext};
-    use language::language_settings::AllLanguageSettings;
     use serde_json::json;
-    use settings::Settings as _;
-    use text::{Buffer, BufferId, Point, ToOffset as _};
+    use text::{Buffer, BufferId, Point, ReplicaId, ToOffset as _};
     use unindent::Unindent as _;
-    use util::path;
-    use worktree::WorktreeSettings;
+    use util::{path, rel_path::rel_path};
 
     #[test]
     fn test_parse_conflicts_in_buffer() {
@@ -293,7 +316,7 @@ mod tests {
         .unindent();
 
         let buffer_id = BufferId::new(1).unwrap();
-        let buffer = Buffer::new(0, buffer_id, test_content);
+        let buffer = Buffer::new(ReplicaId::LOCAL, buffer_id, test_content);
         let snapshot = buffer.snapshot();
 
         let conflict_snapshot = ConflictSet::parse(&snapshot);
@@ -301,6 +324,8 @@ mod tests {
 
         let first = &conflict_snapshot.conflicts[0];
         assert!(first.base.is_none());
+        assert_eq!(first.ours_branch_name.as_ref(), "HEAD");
+        assert_eq!(first.theirs_branch_name.as_ref(), "branch-name");
         let our_text = snapshot
             .text_for_range(first.ours.clone())
             .collect::<String>();
@@ -312,6 +337,8 @@ mod tests {
 
         let second = &conflict_snapshot.conflicts[1];
         assert!(second.base.is_some());
+        assert_eq!(second.ours_branch_name.as_ref(), "HEAD");
+        assert_eq!(second.theirs_branch_name.as_ref(), "branch-name");
         let our_text = snapshot
             .text_for_range(second.ours.clone())
             .collect::<String>();
@@ -343,8 +370,8 @@ mod tests {
         assert_eq!(conflicts_in_range.len(), 1);
 
         // Test with a range that doesn't include any conflicts
-        let range = buffer.anchor_after(first_conflict_end.to_offset(&buffer) + 1)
-            ..buffer.anchor_before(second_conflict_start.to_offset(&buffer) - 1);
+        let range = buffer.anchor_after(first_conflict_end.to_next_offset(&buffer))
+            ..buffer.anchor_before(second_conflict_start.to_previous_offset(&buffer));
         let conflicts_in_range = conflict_snapshot.conflicts_in_range(range, &snapshot);
         assert_eq!(conflicts_in_range.len(), 0);
     }
@@ -368,7 +395,7 @@ mod tests {
         .unindent();
 
         let buffer_id = BufferId::new(1).unwrap();
-        let buffer = Buffer::new(0, buffer_id, test_content.to_string());
+        let buffer = Buffer::new(ReplicaId::LOCAL, buffer_id, test_content);
         let snapshot = buffer.snapshot();
 
         let conflict_snapshot = ConflictSet::parse(&snapshot);
@@ -378,6 +405,8 @@ mod tests {
         // The conflict should have our version, their version, but no base
         let conflict = &conflict_snapshot.conflicts[0];
         assert!(conflict.base.is_none());
+        assert_eq!(conflict.ours_branch_name.as_ref(), "HEAD");
+        assert_eq!(conflict.theirs_branch_name.as_ref(), "branch-nested");
 
         // Check that the nested conflict was detected correctly
         let our_text = snapshot
@@ -388,6 +417,30 @@ mod tests {
             .text_for_range(conflict.theirs.clone())
             .collect::<String>();
         assert_eq!(their_text, "This is their version in a nested conflict\n");
+    }
+
+    #[test]
+    fn test_conflict_markers_at_eof() {
+        let test_content = r#"
+            <<<<<<< ours
+            =======
+            This is their version
+            >>>>>>> "#
+            .unindent();
+        let buffer_id = BufferId::new(1).unwrap();
+        let buffer = Buffer::new(ReplicaId::LOCAL, buffer_id, test_content);
+        let snapshot = buffer.snapshot();
+
+        let conflict_snapshot = ConflictSet::parse(&snapshot);
+        assert_eq!(conflict_snapshot.conflicts.len(), 1);
+        assert_eq!(
+            conflict_snapshot.conflicts[0].ours_branch_name.as_ref(),
+            "ours"
+        );
+        assert_eq!(
+            conflict_snapshot.conflicts[0].theirs_branch_name.as_ref(),
+            "Origin" // default branch name if there is none
+        );
     }
 
     #[test]
@@ -425,11 +478,43 @@ mod tests {
         .unindent();
 
         let buffer_id = BufferId::new(1).unwrap();
-        let buffer = Buffer::new(0, buffer_id, test_content.clone());
+        let buffer = Buffer::new(ReplicaId::LOCAL, buffer_id, test_content.clone());
         let snapshot = buffer.snapshot();
 
         let conflict_snapshot = ConflictSet::parse(&snapshot);
         assert_eq!(conflict_snapshot.conflicts.len(), 4);
+        assert_eq!(
+            conflict_snapshot.conflicts[0].ours_branch_name.as_ref(),
+            "HEAD1"
+        );
+        assert_eq!(
+            conflict_snapshot.conflicts[0].theirs_branch_name.as_ref(),
+            "branch1"
+        );
+        assert_eq!(
+            conflict_snapshot.conflicts[1].ours_branch_name.as_ref(),
+            "HEAD2"
+        );
+        assert_eq!(
+            conflict_snapshot.conflicts[1].theirs_branch_name.as_ref(),
+            "branch2"
+        );
+        assert_eq!(
+            conflict_snapshot.conflicts[2].ours_branch_name.as_ref(),
+            "HEAD3"
+        );
+        assert_eq!(
+            conflict_snapshot.conflicts[2].theirs_branch_name.as_ref(),
+            "branch3"
+        );
+        assert_eq!(
+            conflict_snapshot.conflicts[3].ours_branch_name.as_ref(),
+            "HEAD4"
+        );
+        assert_eq!(
+            conflict_snapshot.conflicts[3].theirs_branch_name.as_ref(),
+            "branch4"
+        );
 
         let range = test_content.find("seven").unwrap()..test_content.find("eleven").unwrap();
         let range = buffer.anchor_before(range.start)..buffer.anchor_after(range.end);
@@ -466,9 +551,6 @@ mod tests {
         zlog::init_test();
         cx.update(|cx| {
             settings::init(cx);
-            WorktreeSettings::register(cx);
-            ProjectSettings::register(cx);
-            AllLanguageSettings::register(cx);
         });
         let initial_text = "
             one
@@ -526,7 +608,7 @@ mod tests {
 
         fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
             state.unmerged_paths.insert(
-                "a.txt".into(),
+                repo_path("a.txt"),
                 UnmergedStatus {
                     first_head: UnmergedStatusCode::Updated,
                     second_head: UnmergedStatusCode::Updated,
@@ -548,7 +630,7 @@ mod tests {
             conflict_set.snapshot().conflicts[0].clone()
         });
         cx.update(|cx| {
-            conflict.resolve(buffer.clone(), &[conflict.theirs.clone()], cx);
+            conflict.resolve(buffer.clone(), std::slice::from_ref(&conflict.theirs), cx);
         });
 
         cx.run_until_parked();
@@ -567,9 +649,6 @@ mod tests {
         zlog::init_test();
         cx.update(|cx| {
             settings::init(cx);
-            WorktreeSettings::register(cx);
-            ProjectSettings::register(cx);
-            AllLanguageSettings::register(cx);
         });
 
         let initial_text = "
@@ -604,7 +683,7 @@ mod tests {
         cx.run_until_parked();
         fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
             state.unmerged_paths.insert(
-                "a.txt".into(),
+                RepoPath::from_rel_path(rel_path("a.txt")),
                 UnmergedStatus {
                     first_head: UnmergedStatusCode::Updated,
                     second_head: UnmergedStatusCode::Updated,
@@ -630,20 +709,20 @@ mod tests {
 
         // Simulate the conflict being removed by e.g. staging the file.
         fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
-            state.unmerged_paths.remove(Path::new("a.txt"))
+            state.unmerged_paths.remove(&repo_path("a.txt"))
         })
         .unwrap();
 
         cx.run_until_parked();
         conflict_set.update(cx, |conflict_set, _| {
-            assert_eq!(conflict_set.has_conflict, false);
+            assert!(!conflict_set.has_conflict);
             assert_eq!(conflict_set.snapshot.conflicts.len(), 0);
         });
 
         // Simulate the conflict being re-added.
         fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
             state.unmerged_paths.insert(
-                "a.txt".into(),
+                repo_path("a.txt"),
                 UnmergedStatus {
                     first_head: UnmergedStatusCode::Updated,
                     second_head: UnmergedStatusCode::Updated,

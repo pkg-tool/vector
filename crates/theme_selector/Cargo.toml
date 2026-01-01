@@ -25,6 +25,5 @@ ui.workspace = true
 util.workspace = true
 workspace.workspace = true
 vector_actions.workspace = true
-workspace-hack.workspace = true
 
 [dev-dependencies]

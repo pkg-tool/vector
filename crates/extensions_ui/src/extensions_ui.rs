@@ -1,11 +1,10 @@
 mod components;
 
-use std::sync::OnceLock;
 use std::time::Duration;
 use std::{ops::Range, sync::Arc};
 
 use extension::api::{ExtensionMetadata, ExtensionProvides};
-use collections::{BTreeMap, BTreeSet};
+use collections::BTreeSet;
 use editor::{Editor, EditorElement, EditorStyle};
 use extension_host::{ExtensionManifest, ExtensionOperation, ExtensionStore};
 use fuzzy::{StringMatchCandidate, match_strings};
@@ -16,21 +15,19 @@ use gpui::{
 };
 use num_format::{Locale, ToFormattedString};
 use project::DirectoryLister;
-use settings::Settings;
+use settings::Settings as _;
 use strum::IntoEnumIterator as _;
 use theme::ThemeSettings;
 use ui::{
-    CheckboxWithLabel, ContextMenu, PopoverMenu, ScrollableHandle, Scrollbar, ScrollbarState,
-    Tooltip, prelude::*,
+    ContextMenu, PopoverMenu, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*,
 };
-use vim_mode_setting::VimModeSetting;
 use workspace::{
     Workspace, WorkspaceId,
     item::{Item, ItemEvent},
 };
 use vector_actions::ExtensionCategoryFilter;
 
-use crate::components::{ExtensionCard, FeatureUpsell};
+use crate::components::ExtensionCard;
 
 actions!(vector, [InstallDevExtension]);
 
@@ -53,11 +50,13 @@ pub fn init(cx: &mut App) {
                         ExtensionCategoryFilter::ContextServers => {
                             ExtensionProvides::ContextServers
                         }
+                        ExtensionCategoryFilter::AgentServers => ExtensionProvides::AgentServers,
                         ExtensionCategoryFilter::SlashCommands => ExtensionProvides::SlashCommands,
                         ExtensionCategoryFilter::IndexedDocsProviders => {
                             ExtensionProvides::IndexedDocsProviders
                         }
                         ExtensionCategoryFilter::Snippets => ExtensionProvides::Snippets,
+                        ExtensionCategoryFilter::DebugAdapters => ExtensionProvides::DebugAdapters,
                     });
 
                     let existing = workspace
@@ -94,8 +93,12 @@ pub fn init(cx: &mut App) {
                         files: false,
                         directories: true,
                         multiple: false,
+                        prompt: None,
                     },
-                    DirectoryLister::Local(workspace.app_state().fs.clone()),
+                    DirectoryLister::Local(
+                        workspace.project().clone(),
+                        workspace.app_state().fs.clone(),
+                    ),
                     window,
                     cx,
                 );
@@ -157,9 +160,11 @@ fn extension_provides_label(provides: ExtensionProvides) -> &'static str {
         ExtensionProvides::Grammars => "Grammars",
         ExtensionProvides::LanguageServers => "Language Servers",
         ExtensionProvides::ContextServers => "MCP Servers",
+        ExtensionProvides::AgentServers => "Agent Servers",
         ExtensionProvides::SlashCommands => "Slash Commands",
         ExtensionProvides::IndexedDocsProviders => "Indexed Docs Providers",
         ExtensionProvides::Snippets => "Snippets",
+        ExtensionProvides::DebugAdapters => "Debug Adapters",
     }
 }
 
@@ -170,55 +175,6 @@ pub enum ExtensionStatus {
     Upgrading,
     Installed(Arc<str>),
     Removing,
-}
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
-enum Feature {
-    Git,
-    OpenIn,
-    Vim,
-    LanguageBash,
-    LanguageC,
-    LanguageCpp,
-    LanguageGo,
-    LanguagePython,
-    LanguageReact,
-    LanguageRust,
-    LanguageTypescript,
-}
-
-fn keywords_by_feature() -> &'static BTreeMap<Feature, Vec<&'static str>> {
-    static KEYWORDS_BY_FEATURE: OnceLock<BTreeMap<Feature, Vec<&'static str>>> = OnceLock::new();
-    KEYWORDS_BY_FEATURE.get_or_init(|| {
-        BTreeMap::from_iter([
-            (Feature::Git, vec!["git"]),
-            (
-                Feature::OpenIn,
-                vec![
-                    "github",
-                    "gitlab",
-                    "bitbucket",
-                    "codeberg",
-                    "sourcehut",
-                    "permalink",
-                    "link",
-                    "open in",
-                ],
-            ),
-            (Feature::Vim, vec!["vim"]),
-            (Feature::LanguageBash, vec!["sh", "bash"]),
-            (Feature::LanguageC, vec!["c", "clang"]),
-            (Feature::LanguageCpp, vec!["c++", "cpp", "clang"]),
-            (Feature::LanguageGo, vec!["go", "golang"]),
-            (Feature::LanguagePython, vec!["python", "py"]),
-            (Feature::LanguageReact, vec!["react"]),
-            (Feature::LanguageRust, vec!["rust", "rs"]),
-            (
-                Feature::LanguageTypescript,
-                vec!["type", "typescript", "ts"],
-            ),
-        ])
-    })
 }
 
 struct ExtensionCardButtons {
@@ -238,8 +194,6 @@ pub struct ExtensionsPage {
     provides_filter: Option<ExtensionProvides>,
     _subscriptions: [gpui::Subscription; 2],
     extension_fetch_task: Option<Task<()>>,
-    upsells: BTreeSet<Feature>,
-    scrollbar_state: ScrollbarState,
 }
 
 impl ExtensionsPage {
@@ -275,7 +229,7 @@ impl ExtensionsPage {
 
             let query_editor = cx.new(|cx| {
                 let mut input = Editor::single_line(window, cx);
-                input.set_placeholder_text("Search extensions...", cx);
+                input.set_placeholder_text("Search extensions...", window, cx);
                 input
             });
             cx.subscribe(&query_editor, Self::on_query_change).detach();
@@ -293,8 +247,6 @@ impl ExtensionsPage {
                 extension_fetch_task: None,
                 _subscriptions: subscriptions,
                 query_editor,
-                upsells: BTreeSet::default(),
-                scrollbar_state: ScrollbarState::new(scroll_handle),
             };
             this.fetch_extensions(
                 None,
@@ -376,7 +328,8 @@ impl ExtensionsPage {
     }
 
     fn scroll_to_top(&mut self, cx: &mut Context<Self>) {
-        self.list.set_offset(point(px(0.), px(0.)));
+        self.list
+            .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -415,6 +368,7 @@ impl ExtensionsPage {
                     &match_candidates,
                     &search,
                     false,
+                    true,
                     match_candidates.len(),
                     &Default::default(),
                     cx.background_executor().clone(),
@@ -970,7 +924,6 @@ impl ExtensionsPage {
             })),
             cx,
         );
-        self.refresh_feature_upsells(cx);
     }
 
     pub fn change_provides_filter(
@@ -1041,111 +994,10 @@ impl ExtensionsPage {
 
         Label::new(message)
     }
-
-    fn update_settings<T: Settings>(
-        &mut self,
-        selection: &ToggleState,
-
-        cx: &mut Context<Self>,
-        callback: impl 'static + Send + Fn(&mut T::FileContent, bool),
-    ) {
-        if let Some(workspace) = self.workspace.upgrade() {
-            let fs = workspace.read(cx).app_state().fs.clone();
-            let selection = *selection;
-            settings::update_settings_file::<T>(fs, cx, move |settings, _| {
-                let value = match selection {
-                    ToggleState::Unselected => false,
-                    ToggleState::Selected => true,
-                    _ => return,
-                };
-
-                callback(settings, value)
-            });
-        }
-    }
-
-    fn refresh_feature_upsells(&mut self, cx: &mut Context<Self>) {
-        let Some(search) = self.search_query(cx) else {
-            self.upsells.clear();
-            return;
-        };
-
-        let search = search.to_lowercase();
-        let search_terms = search
-            .split_whitespace()
-            .map(|term| term.trim())
-            .collect::<Vec<_>>();
-
-        for (feature, keywords) in keywords_by_feature() {
-            if keywords
-                .iter()
-                .any(|keyword| search_terms.contains(keyword))
-            {
-                self.upsells.insert(*feature);
-            } else {
-                self.upsells.remove(feature);
-            }
-        }
-    }
-
-    fn render_feature_upsells(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let upsells_count = self.upsells.len();
-
-        v_flex().children(self.upsells.iter().enumerate().map(|(ix, feature)| {
-            let upsell = match feature {
-                Feature::Git => FeatureUpsell::new(
-                    "Vector comes with basic Git support. More Git features are coming in the future.",
-                )
-                .docs_url("https://github.com/pkg-tool/vector/blob/master/docs/src/git.md"),
-                Feature::OpenIn => FeatureUpsell::new(
-                    "Vector supports linking to a source line on GitHub and others.",
-                )
-                .docs_url("https://github.com/pkg-tool/vector/blob/master/docs/src/git.md#git-integrations"),
-                Feature::Vim => FeatureUpsell::new("Vim support is built-in to Vector!")
-                    .docs_url("https://github.com/pkg-tool/vector/blob/master/docs/src/vim.md")
-                    .child(CheckboxWithLabel::new(
-                        "enable-vim",
-                        Label::new("Enable vim mode"),
-                        if VimModeSetting::get_global(cx).0 {
-                            ui::ToggleState::Selected
-                        } else {
-                            ui::ToggleState::Unselected
-                        },
-                        cx.listener(move |this, selection, _, cx| {
-                            this.update_settings::<VimModeSetting>(
-                                selection,
-                                cx,
-                                |setting, value| *setting = Some(value),
-                            );
-                        }),
-                    )),
-                Feature::LanguageBash => FeatureUpsell::new("Shell support is built-in to Vector!")
-                    .docs_url("https://github.com/pkg-tool/vector/blob/master/docs/src/languages/bash.md"),
-                Feature::LanguageC => FeatureUpsell::new("C support is built-in to Vector!")
-                    .docs_url("https://github.com/pkg-tool/vector/blob/master/docs/src/languages/c.md"),
-                Feature::LanguageCpp => FeatureUpsell::new("C++ support is built-in to Vector!")
-                    .docs_url("https://github.com/pkg-tool/vector/blob/master/docs/src/languages/cpp.md"),
-                Feature::LanguageGo => FeatureUpsell::new("Go support is built-in to Vector!")
-                    .docs_url("https://github.com/pkg-tool/vector/blob/master/docs/src/languages/go.md"),
-                Feature::LanguagePython => FeatureUpsell::new("Python support is built-in to Vector!")
-                    .docs_url("https://github.com/pkg-tool/vector/blob/master/docs/languages/python.md"),
-                Feature::LanguageReact => FeatureUpsell::new("React support is built-in to Vector!")
-                    .docs_url("https://github.com/pkg-tool/vector/blob/master/docs/languages/typescript.md"),
-                Feature::LanguageRust => FeatureUpsell::new("Rust support is built-in to Vector!")
-                    .docs_url("https://github.com/pkg-tool/vector/blob/master/docs/languages/rust.md"),
-                Feature::LanguageTypescript => {
-                    FeatureUpsell::new("Typescript support is built-in to Vector!")
-                        .docs_url("https://github.com/pkg-tool/vector/blob/master/docs/languages/typescript.md")
-                }
-            };
-
-            upsell.when(ix < upsells_count, |upsell| upsell.border_b_1())
-        }))
-    }
 }
 
 impl Render for ExtensionsPage {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
             .bg(cx.theme().colors().editor_background)
@@ -1219,7 +1071,6 @@ impl Render for ExtensionsPage {
                         })
                     })),
             )
-            .child(self.render_feature_upsells(cx))
             .child(
                 v_flex()
                     .pl_4()
@@ -1229,31 +1080,27 @@ impl Render for ExtensionsPage {
                     .map(|this| {
                         let count = self.remote_extension_entries.len() + self.dev_extension_entries.len();
 
-                        if count == 0 {
-                            return this.py_4().child(self.render_empty_state(cx));
-                        }
-
-                        let extensions_page = cx.entity().clone();
-                        let scroll_handle = self.list.clone();
-                        this.child(
-                            uniform_list(
-                                extensions_page,
-                                "entries",
-                                count,
-                                Self::render_extensions,
+                        let list_content = if count == 0 {
+                            this.py_4().child(self.render_empty_state(cx))
+                        } else {
+                            this.child(
+                                uniform_list(
+                                    "entries",
+                                    count,
+                                    cx.processor(Self::render_extensions),
+                                )
+                                .flex_grow()
+                                .pb_4()
+                                .track_scroll(&self.list),
                             )
-                            .flex_grow()
-                            .pb_4()
-                            .track_scroll(scroll_handle),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .right_1()
-                                .top_0()
-                                .bottom_0()
-                                .w(px(12.))
-                                .children(Scrollbar::vertical(self.scrollbar_state.clone())),
+                        };
+
+                        list_content.custom_scrollbars(
+                            Scrollbars::new(ScrollAxes::Vertical)
+                                .tracked_scroll_handle(&self.list)
+                                .width_sm(),
+                            window,
+                            cx,
                         )
                     }),
             )
@@ -1284,8 +1131,8 @@ impl Item for ExtensionsPage {
         _workspace_id: Option<WorkspaceId>,
         _window: &mut Window,
         _: &mut Context<Self>,
-    ) -> Option<Entity<Self>> {
-        None
+    ) -> Task<Option<Entity<Self>>> {
+        Task::ready(None)
     }
 
     fn to_item_events(event: &Self::Event, mut f: impl FnMut(workspace::item::ItemEvent)) {

@@ -1,31 +1,40 @@
 mod signature_help;
 
 use crate::{
-    CodeAction, CompletionSource, CoreCompletion, DocumentHighlight, DocumentSymbol, Hover,
-    HoverBlock, HoverBlockKind, InlayHint, InlayHintLabel, InlayHintLabelPart,
-    InlayHintLabelPartTooltip, InlayHintTooltip, Location, LocationLink, LspAction, MarkupContent,
-    PrepareRenameResponse, ProjectTransaction, ResolveState,
+    CodeAction, CompletionSource, CoreCompletion, CoreCompletionResponse, DocumentColor,
+    DocumentHighlight, DocumentSymbol, Hover, HoverBlock, HoverBlockKind, InlayHint,
+    InlayHintLabel, InlayHintLabelPart, InlayHintLabelPartTooltip, InlayHintTooltip, Location,
+    LocationLink, LspAction, LspPullDiagnostics, MarkupContent, PrepareRenameResponse,
+    ProjectTransaction, PulledDiagnostics, ResolveState,
     lsp_store::{LocalLspStore, LspStore},
 };
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
-use collections::HashSet;
+use rpc::proto::{self, PeerId};
+use clock::Global;
+use collections::{HashMap, HashSet};
 use futures::future;
-use gpui::{App, AsyncApp, Entity};
+use gpui::{App, AsyncApp, Entity, SharedString, Task};
 use language::{
-    Anchor, Bias, Buffer, BufferSnapshot, CachedLspAdapter, CharKind, OffsetRangeExt, PointUtf16,
-    ToOffset, ToPointUtf16, Transaction, Unclipped,
-    language_settings::{InlayHintKind, LanguageSettings},
+    Anchor, Bias, Buffer, BufferSnapshot, CachedLspAdapter, CharKind, CharScopeContext,
+    OffsetRangeExt, PointUtf16, ToOffset, ToPointUtf16, Transaction, Unclipped,
+    language_settings::{InlayHintKind, LanguageSettings, language_settings},
     point_from_lsp, point_to_lsp,
     range_from_lsp, range_to_lsp,
 };
 use lsp::{
-    AdapterServerCapabilities, CodeActionKind, CodeActionOptions, CompletionContext,
-    LanguageServer, LanguageServerId,
-    LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, ServerCapabilities,
+    AdapterServerCapabilities, CodeActionKind, CodeActionOptions, CodeDescription,
+    CompletionContext, CompletionListItemDefaultsEditRange, CompletionTriggerKind,
+    DocumentHighlightKind, LanguageServer, LanguageServerId, LinkedEditingRangeServerCapabilities,
+    OneOf, RenameOptions, ServerCapabilities,
 };
-use std::{cmp::Reverse, ops::Range, path::Path, sync::Arc};
-use text::LineEnding;
+use serde_json::Value;
+use signature_help::{lsp_to_proto_signature, proto_to_lsp_signature};
+use std::{
+    cmp::Reverse, collections::hash_map, mem, ops::Range, path::Path, str::FromStr, sync::Arc,
+};
+use text::{BufferId, LineEnding};
+use util::{ResultExt as _, debug_panic};
 
 pub use signature_help::SignatureHelp;
 
@@ -40,8 +49,8 @@ pub fn lsp_formatting_options(settings: &LanguageSettings) -> lsp::FormattingOpt
     }
 }
 
-pub(crate) fn file_path_to_lsp_url(path: &Path) -> Result<lsp::Url> {
-    match lsp::url_from_file_path(path) {
+pub fn file_path_to_lsp_url(path: &Path) -> Result<lsp::Uri> {
+    match lsp::Uri::from_file_path(path) {
         Ok(url) => Ok(url),
         Err(()) => anyhow::bail!("Invalid file path provided to LSP request: {path:?}"),
     }
@@ -96,9 +105,7 @@ pub trait LspCommand: 'static + Sized + Send + std::fmt::Debug {
     }
 
     /// When false, `to_lsp_params_or_response` default implementation will return the default response.
-    fn check_capabilities(&self, _: AdapterServerCapabilities) -> bool {
-        true
-    }
+    fn check_capabilities(&self, _: AdapterServerCapabilities) -> bool;
 
     fn to_lsp(
         &self,
@@ -135,27 +142,27 @@ pub(crate) struct PerformRename {
     pub push_to_history: bool,
 }
 
-#[derive(Debug)]
-pub struct GetDefinition {
+#[derive(Debug, Clone, Copy)]
+pub struct GetDefinitions {
     pub position: PointUtf16,
 }
 
-#[derive(Debug)]
-pub(crate) struct GetDeclaration {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GetDeclarations {
     pub position: PointUtf16,
 }
 
-#[derive(Debug)]
-pub(crate) struct GetTypeDefinition {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GetTypeDefinitions {
     pub position: PointUtf16,
 }
 
-#[derive(Debug)]
-pub(crate) struct GetImplementation {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GetImplementations {
     pub position: PointUtf16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct GetReferences {
     pub position: PointUtf16,
 }
@@ -182,6 +189,7 @@ pub(crate) struct GetHover {
 pub(crate) struct GetCompletions {
     pub position: PointUtf16,
     pub context: CompletionContext,
+    pub server_id: Option<lsp::LanguageServerId>,
 }
 
 #[derive(Clone, Debug)]
@@ -198,13 +206,16 @@ pub(crate) struct OnTypeFormatting {
     pub push_to_history: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct InlayHints {
     pub range: Range<Anchor>,
 }
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct GetCodeLens;
+
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct GetDocumentColor;
 
 impl GetCodeLens {
     pub(crate) fn can_resolve_lens(capabilities: &ServerCapabilities) -> bool {
@@ -221,6 +232,15 @@ pub(crate) struct LinkedEditingRange {
     pub position: Anchor,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct GetDocumentDiagnostics {
+    /// We cannot blindly rely on server's capabilities.diagnostic_provider, as they're a singular field, whereas
+    /// a server can register multiple diagnostic providers post-mortem.
+    pub registration_id: Option<SharedString>,
+    pub identifier: Option<String>,
+    pub previous_result_id: Option<SharedString>,
+}
+
 #[async_trait(?Send)]
 impl LspCommand for PrepareRename {
     type Response = PrepareRenameResponse;
@@ -228,6 +248,16 @@ impl LspCommand for PrepareRename {
 
     fn display_name(&self) -> &str {
         "Prepare rename"
+    }
+
+    fn check_capabilities(&self, capabilities: AdapterServerCapabilities) -> bool {
+        capabilities
+            .server_capabilities
+            .rename_provider
+            .is_some_and(|capability| match capability {
+                OneOf::Left(enabled) => enabled,
+                OneOf::Right(options) => options.prepare_provider.unwrap_or(false),
+            })
     }
 
     fn to_lsp_params_or_response(
@@ -277,9 +307,9 @@ impl LspCommand for PrepareRename {
         _: Entity<LspStore>,
         buffer: Entity<Buffer>,
         _: LanguageServerId,
-        mut cx: AsyncApp,
+        cx: AsyncApp,
     ) -> Result<PrepareRenameResponse> {
-        buffer.read_with(&mut cx, |buffer, _| match message {
+        buffer.read_with(&cx, |buffer, _| match message {
             Some(lsp::PrepareRenameResponse::Range(range))
             | Some(lsp::PrepareRenameResponse::RangeWithPlaceholder { range, .. }) => {
                 let Range { start, end } = range_from_lsp(range);
@@ -295,12 +325,110 @@ impl LspCommand for PrepareRename {
             }
             Some(lsp::PrepareRenameResponse::DefaultBehavior { .. }) => {
                 let snapshot = buffer.snapshot();
-                let (range, _) = snapshot.surrounding_word(self.position);
+                let (range, _) = snapshot.surrounding_word(self.position, None);
                 let range = snapshot.anchor_after(range.start)..snapshot.anchor_before(range.end);
                 Ok(PrepareRenameResponse::Success(range))
             }
             None => Ok(PrepareRenameResponse::InvalidPosition),
         })?
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::PrepareRename {
+        proto::PrepareRename {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::PrepareRename,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: PrepareRenameResponse,
+        _: &mut LspStore,
+        _: PeerId,
+        buffer_version: &clock::Global,
+        _: &mut App,
+    ) -> proto::PrepareRenameResponse {
+        match response {
+            PrepareRenameResponse::Success(range) => proto::PrepareRenameResponse {
+                can_rename: true,
+                only_unprepared_rename_supported: false,
+                start: Some(language::proto::serialize_anchor(&range.start)),
+                end: Some(language::proto::serialize_anchor(&range.end)),
+                version: serialize_version(buffer_version),
+            },
+            PrepareRenameResponse::OnlyUnpreparedRenameSupported => proto::PrepareRenameResponse {
+                can_rename: false,
+                only_unprepared_rename_supported: true,
+                start: None,
+                end: None,
+                version: vec![],
+            },
+            PrepareRenameResponse::InvalidPosition => proto::PrepareRenameResponse {
+                can_rename: false,
+                only_unprepared_rename_supported: false,
+                start: None,
+                end: None,
+                version: vec![],
+            },
+        }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::PrepareRenameResponse,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<PrepareRenameResponse> {
+        if message.can_rename {
+            buffer
+                .update(&mut cx, |buffer, _| {
+                    buffer.wait_for_version(deserialize_version(&message.version))
+                })?
+                .await?;
+            if let (Some(start), Some(end)) = (
+                message.start.and_then(deserialize_anchor),
+                message.end.and_then(deserialize_anchor),
+            ) {
+                Ok(PrepareRenameResponse::Success(start..end))
+            } else {
+                anyhow::bail!(
+                    "Missing start or end position in remote project PrepareRenameResponse"
+                );
+            }
+        } else if message.only_unprepared_rename_supported {
+            Ok(PrepareRenameResponse::OnlyUnpreparedRenameSupported)
+        } else {
+            Ok(PrepareRenameResponse::InvalidPosition)
+        }
+    }
+
+    fn buffer_id_from_proto(message: &proto::PrepareRename) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
     }
 }
 
@@ -311,6 +439,16 @@ impl LspCommand for PerformRename {
 
     fn display_name(&self) -> &str {
         "Rename"
+    }
+
+    fn check_capabilities(&self, capabilities: AdapterServerCapabilities) -> bool {
+        capabilities
+            .server_capabilities
+            .rename_provider
+            .is_some_and(|capability| match capability {
+                OneOf::Left(enabled) => enabled,
+                OneOf::Right(_options) => true,
+            })
     }
 
     fn to_lsp(
@@ -336,13 +474,12 @@ impl LspCommand for PerformRename {
         mut cx: AsyncApp,
     ) -> Result<ProjectTransaction> {
         if let Some(edit) = message {
-            let (lsp_adapter, lsp_server) =
+            let (_, lsp_server) =
                 language_server_for_buffer(&lsp_store, &buffer, server_id, &mut cx)?;
             LocalLspStore::deserialize_workspace_edit(
                 lsp_store,
                 edit,
                 self.push_to_history,
-                lsp_adapter,
                 lsp_server,
                 &mut cx,
             )
@@ -351,10 +488,80 @@ impl LspCommand for PerformRename {
             Ok(ProjectTransaction::default())
         }
     }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::PerformRename {
+        proto::PerformRename {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            new_name: self.new_name.clone(),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::PerformRename,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+            new_name: message.new_name,
+            push_to_history: false,
+        })
+    }
+
+    fn response_to_proto(
+        response: ProjectTransaction,
+        lsp_store: &mut LspStore,
+        peer_id: PeerId,
+        _: &clock::Global,
+        cx: &mut App,
+    ) -> proto::PerformRenameResponse {
+        let transaction = lsp_store.buffer_store().update(cx, |buffer_store, cx| {
+            buffer_store.serialize_project_transaction_for_peer(response, peer_id, cx)
+        });
+        proto::PerformRenameResponse {
+            transaction: Some(transaction),
+        }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::PerformRenameResponse,
+        lsp_store: Entity<LspStore>,
+        _: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<ProjectTransaction> {
+        let message = message.transaction.context("missing transaction")?;
+        lsp_store
+            .update(&mut cx, |lsp_store, cx| {
+                lsp_store.buffer_store().update(cx, |buffer_store, cx| {
+                    buffer_store.deserialize_project_transaction(message, self.push_to_history, cx)
+                })
+            })?
+            .await
+    }
+
+    fn buffer_id_from_proto(message: &proto::PerformRename) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
+    }
 }
 
 #[async_trait(?Send)]
-impl LspCommand for GetDefinition {
+impl LspCommand for GetDefinitions {
     type Response = Vec<LocationLink>;
     type LspRequest = lsp::request::GotoDefinition;
 
@@ -366,7 +573,10 @@ impl LspCommand for GetDefinition {
         capabilities
             .server_capabilities
             .definition_provider
-            .is_some()
+            .is_some_and(|capability| match capability {
+                OneOf::Left(supported) => supported,
+                OneOf::Right(_options) => true,
+            })
     }
 
     fn to_lsp(
@@ -393,10 +603,66 @@ impl LspCommand for GetDefinition {
     ) -> Result<Vec<LocationLink>> {
         location_links_from_lsp(message, lsp_store, buffer, server_id, cx).await
     }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetDefinition {
+        proto::GetDefinition {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::GetDefinition,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: Vec<LocationLink>,
+        lsp_store: &mut LspStore,
+        peer_id: PeerId,
+        _: &clock::Global,
+        cx: &mut App,
+    ) -> proto::GetDefinitionResponse {
+        let links = location_links_to_proto(response, lsp_store, peer_id, cx);
+        proto::GetDefinitionResponse { links }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::GetDefinitionResponse,
+        lsp_store: Entity<LspStore>,
+        _: Entity<Buffer>,
+        cx: AsyncApp,
+    ) -> Result<Vec<LocationLink>> {
+        location_links_from_proto(message.links, lsp_store, cx).await
+    }
+
+    fn buffer_id_from_proto(message: &proto::GetDefinition) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
+    }
 }
 
 #[async_trait(?Send)]
-impl LspCommand for GetDeclaration {
+impl LspCommand for GetDeclarations {
     type Response = Vec<LocationLink>;
     type LspRequest = lsp::request::GotoDeclaration;
 
@@ -408,7 +674,11 @@ impl LspCommand for GetDeclaration {
         capabilities
             .server_capabilities
             .declaration_provider
-            .is_some()
+            .is_some_and(|capability| match capability {
+                lsp::DeclarationCapability::Simple(supported) => supported,
+                lsp::DeclarationCapability::RegistrationOptions(..) => true,
+                lsp::DeclarationCapability::Options(..) => true,
+            })
     }
 
     fn to_lsp(
@@ -435,15 +705,81 @@ impl LspCommand for GetDeclaration {
     ) -> Result<Vec<LocationLink>> {
         location_links_from_lsp(message, lsp_store, buffer, server_id, cx).await
     }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetDeclaration {
+        proto::GetDeclaration {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::GetDeclaration,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: Vec<LocationLink>,
+        lsp_store: &mut LspStore,
+        peer_id: PeerId,
+        _: &clock::Global,
+        cx: &mut App,
+    ) -> proto::GetDeclarationResponse {
+        let links = location_links_to_proto(response, lsp_store, peer_id, cx);
+        proto::GetDeclarationResponse { links }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::GetDeclarationResponse,
+        lsp_store: Entity<LspStore>,
+        _: Entity<Buffer>,
+        cx: AsyncApp,
+    ) -> Result<Vec<LocationLink>> {
+        location_links_from_proto(message.links, lsp_store, cx).await
+    }
+
+    fn buffer_id_from_proto(message: &proto::GetDeclaration) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
+    }
 }
 
 #[async_trait(?Send)]
-impl LspCommand for GetImplementation {
+impl LspCommand for GetImplementations {
     type Response = Vec<LocationLink>;
     type LspRequest = lsp::request::GotoImplementation;
 
     fn display_name(&self) -> &str {
         "Get implementation"
+    }
+
+    fn check_capabilities(&self, capabilities: AdapterServerCapabilities) -> bool {
+        capabilities
+            .server_capabilities
+            .implementation_provider
+            .is_some_and(|capability| match capability {
+                lsp::ImplementationProviderCapability::Simple(enabled) => enabled,
+                lsp::ImplementationProviderCapability::Options(_options) => true,
+            })
     }
 
     fn to_lsp(
@@ -470,10 +806,66 @@ impl LspCommand for GetImplementation {
     ) -> Result<Vec<LocationLink>> {
         location_links_from_lsp(message, lsp_store, buffer, server_id, cx).await
     }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetImplementation {
+        proto::GetImplementation {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::GetImplementation,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: Vec<LocationLink>,
+        lsp_store: &mut LspStore,
+        peer_id: PeerId,
+        _: &clock::Global,
+        cx: &mut App,
+    ) -> proto::GetImplementationResponse {
+        let links = location_links_to_proto(response, lsp_store, peer_id, cx);
+        proto::GetImplementationResponse { links }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::GetImplementationResponse,
+        project: Entity<LspStore>,
+        _: Entity<Buffer>,
+        cx: AsyncApp,
+    ) -> Result<Vec<LocationLink>> {
+        location_links_from_proto(message.links, project, cx).await
+    }
+
+    fn buffer_id_from_proto(message: &proto::GetImplementation) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
+    }
 }
 
 #[async_trait(?Send)]
-impl LspCommand for GetTypeDefinition {
+impl LspCommand for GetTypeDefinitions {
     type Response = Vec<LocationLink>;
     type LspRequest = lsp::request::GotoTypeDefinition;
 
@@ -511,6 +903,62 @@ impl LspCommand for GetTypeDefinition {
         cx: AsyncApp,
     ) -> Result<Vec<LocationLink>> {
         location_links_from_lsp(message, project, buffer, server_id, cx).await
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetTypeDefinition {
+        proto::GetTypeDefinition {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::GetTypeDefinition,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: Vec<LocationLink>,
+        lsp_store: &mut LspStore,
+        peer_id: PeerId,
+        _: &clock::Global,
+        cx: &mut App,
+    ) -> proto::GetTypeDefinitionResponse {
+        let links = location_links_to_proto(response, lsp_store, peer_id, cx);
+        proto::GetTypeDefinitionResponse { links }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::GetTypeDefinitionResponse,
+        project: Entity<LspStore>,
+        _: Entity<Buffer>,
+        cx: AsyncApp,
+    ) -> Result<Vec<LocationLink>> {
+        location_links_from_proto(message.links, project, cx).await
+    }
+
+    fn buffer_id_from_proto(message: &proto::GetTypeDefinition) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
     }
 }
 
@@ -564,18 +1012,12 @@ pub async fn location_links_from_lsp(
         }
     }
 
-    let (lsp_adapter, language_server) =
-        language_server_for_buffer(&lsp_store, &buffer, server_id, &mut cx)?;
+    let (_, language_server) = language_server_for_buffer(&lsp_store, &buffer, server_id, &mut cx)?;
     let mut definitions = Vec::new();
     for (origin_range, target_uri, target_range) in unresolved_links {
         let target_buffer_handle = lsp_store
             .update(&mut cx, |this, cx| {
-                this.open_local_buffer_via_lsp(
-                    target_uri,
-                    language_server.server_id(),
-                    lsp_adapter.name.clone(),
-                    cx,
-                )
+                this.open_local_buffer_via_lsp(target_uri, language_server.server_id(), cx)
             })?
             .await?;
 
@@ -620,8 +1062,7 @@ pub async fn location_link_from_lsp(
     server_id: LanguageServerId,
     cx: &mut AsyncApp,
 ) -> Result<LocationLink> {
-    let (lsp_adapter, language_server) =
-        language_server_for_buffer(&lsp_store, &buffer, server_id, cx)?;
+    let (_, language_server) = language_server_for_buffer(lsp_store, buffer, server_id, cx)?;
 
     let (origin_range, target_uri, target_range) = (
         link.origin_selection_range,
@@ -631,12 +1072,7 @@ pub async fn location_link_from_lsp(
 
     let target_buffer_handle = lsp_store
         .update(cx, |lsp_store, cx| {
-            lsp_store.open_local_buffer_via_lsp(
-                target_uri,
-                language_server.server_id(),
-                lsp_adapter.name.clone(),
-                cx,
-            )
+            lsp_store.open_local_buffer_via_lsp(target_uri, language_server.server_id(), cx)
         })?
         .await?;
 
@@ -719,7 +1155,7 @@ impl LspCommand for GetReferences {
         mut cx: AsyncApp,
     ) -> Result<Vec<Location>> {
         let mut references = Vec::new();
-        let (lsp_adapter, language_server) =
+        let (_, language_server) =
             language_server_for_buffer(&lsp_store, &buffer, server_id, &mut cx)?;
 
         if let Some(locations) = locations {
@@ -729,7 +1165,6 @@ impl LspCommand for GetReferences {
                         lsp_store.open_local_buffer_via_lsp(
                             lsp_location.uri,
                             language_server.server_id(),
-                            lsp_adapter.name.clone(),
                             cx,
                         )
                     })?
@@ -737,7 +1172,7 @@ impl LspCommand for GetReferences {
 
                 target_buffer_handle
                     .clone()
-                    .read_with(&mut cx, |target_buffer, _| {
+                    .read_with(&cx, |target_buffer, _| {
                         let target_start = target_buffer
                             .clip_point_utf16(point_from_lsp(lsp_location.range.start), Bias::Left);
                         let target_end = target_buffer
@@ -752,6 +1187,102 @@ impl LspCommand for GetReferences {
         }
 
         Ok(references)
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetReferences {
+        proto::GetReferences {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::GetReferences,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: Vec<Location>,
+        lsp_store: &mut LspStore,
+        peer_id: PeerId,
+        _: &clock::Global,
+        cx: &mut App,
+    ) -> proto::GetReferencesResponse {
+        let locations = response
+            .into_iter()
+            .map(|definition| {
+                lsp_store
+                    .buffer_store()
+                    .update(cx, |buffer_store, cx| {
+                        buffer_store.create_buffer_for_peer(&definition.buffer, peer_id, cx)
+                    })
+                    .detach_and_log_err(cx);
+                let buffer_id = definition.buffer.read(cx).remote_id();
+                proto::Location {
+                    start: Some(serialize_anchor(&definition.range.start)),
+                    end: Some(serialize_anchor(&definition.range.end)),
+                    buffer_id: buffer_id.into(),
+                }
+            })
+            .collect();
+        proto::GetReferencesResponse { locations }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::GetReferencesResponse,
+        project: Entity<LspStore>,
+        _: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Vec<Location>> {
+        let mut locations = Vec::new();
+        for location in message.locations {
+            let buffer_id = BufferId::new(location.buffer_id)?;
+            let target_buffer = project
+                .update(&mut cx, |this, cx| {
+                    this.wait_for_remote_buffer(buffer_id, cx)
+                })?
+                .await?;
+            let start = location
+                .start
+                .and_then(deserialize_anchor)
+                .context("missing target start")?;
+            let end = location
+                .end
+                .and_then(deserialize_anchor)
+                .context("missing target end")?;
+            target_buffer
+                .update(&mut cx, |buffer, _| buffer.wait_for_anchors([start, end]))?
+                .await?;
+            locations.push(Location {
+                buffer: target_buffer,
+                range: start..end,
+            })
+        }
+        Ok(locations)
+    }
+
+    fn buffer_id_from_proto(message: &proto::GetReferences) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
     }
 }
 
@@ -768,7 +1299,10 @@ impl LspCommand for GetDocumentHighlights {
         capabilities
             .server_capabilities
             .document_highlight_provider
-            .is_some()
+            .is_some_and(|capability| match capability {
+                OneOf::Left(supported) => supported,
+                OneOf::Right(_options) => true,
+            })
     }
 
     fn to_lsp(
@@ -791,9 +1325,9 @@ impl LspCommand for GetDocumentHighlights {
         _: Entity<LspStore>,
         buffer: Entity<Buffer>,
         _: LanguageServerId,
-        mut cx: AsyncApp,
+        cx: AsyncApp,
     ) -> Result<Vec<DocumentHighlight>> {
-        buffer.read_with(&mut cx, |buffer, _| {
+        buffer.read_with(&cx, |buffer, _| {
             let mut lsp_highlights = lsp_highlights.unwrap_or_default();
             lsp_highlights.sort_unstable_by_key(|h| (h.range.start, Reverse(h.range.end)));
             lsp_highlights
@@ -813,6 +1347,98 @@ impl LspCommand for GetDocumentHighlights {
                 .collect()
         })
     }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetDocumentHighlights {
+        proto::GetDocumentHighlights {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::GetDocumentHighlights,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: Vec<DocumentHighlight>,
+        _: &mut LspStore,
+        _: PeerId,
+        _: &clock::Global,
+        _: &mut App,
+    ) -> proto::GetDocumentHighlightsResponse {
+        let highlights = response
+            .into_iter()
+            .map(|highlight| proto::DocumentHighlight {
+                start: Some(serialize_anchor(&highlight.range.start)),
+                end: Some(serialize_anchor(&highlight.range.end)),
+                kind: match highlight.kind {
+                    DocumentHighlightKind::TEXT => proto::document_highlight::Kind::Text.into(),
+                    DocumentHighlightKind::WRITE => proto::document_highlight::Kind::Write.into(),
+                    DocumentHighlightKind::READ => proto::document_highlight::Kind::Read.into(),
+                    _ => proto::document_highlight::Kind::Text.into(),
+                },
+            })
+            .collect();
+        proto::GetDocumentHighlightsResponse { highlights }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::GetDocumentHighlightsResponse,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Vec<DocumentHighlight>> {
+        let mut highlights = Vec::new();
+        for highlight in message.highlights {
+            let start = highlight
+                .start
+                .and_then(deserialize_anchor)
+                .context("missing target start")?;
+            let end = highlight
+                .end
+                .and_then(deserialize_anchor)
+                .context("missing target end")?;
+            buffer
+                .update(&mut cx, |buffer, _| buffer.wait_for_anchors([start, end]))?
+                .await?;
+            let kind = match proto::document_highlight::Kind::from_i32(highlight.kind) {
+                Some(proto::document_highlight::Kind::Text) => DocumentHighlightKind::TEXT,
+                Some(proto::document_highlight::Kind::Read) => DocumentHighlightKind::READ,
+                Some(proto::document_highlight::Kind::Write) => DocumentHighlightKind::WRITE,
+                None => DocumentHighlightKind::TEXT,
+            };
+            highlights.push(DocumentHighlight {
+                range: start..end,
+                kind,
+            });
+        }
+        Ok(highlights)
+    }
+
+    fn buffer_id_from_proto(message: &proto::GetDocumentHighlights) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
+    }
 }
 
 #[async_trait(?Send)]
@@ -828,7 +1454,10 @@ impl LspCommand for GetDocumentSymbols {
         capabilities
             .server_capabilities
             .document_symbol_provider
-            .is_some()
+            .is_some_and(|capability| match capability {
+                OneOf::Left(supported) => supported,
+                OneOf::Right(_options) => true,
+            })
     }
 
     fn to_lsp(
@@ -923,12 +1552,93 @@ impl LspCommand for GetSignatureHelp {
     async fn response_from_lsp(
         self,
         message: Option<lsp::SignatureHelp>,
-        _: Entity<LspStore>,
+        lsp_store: Entity<LspStore>,
         _: Entity<Buffer>,
-        _: LanguageServerId,
-        _: AsyncApp,
+        id: LanguageServerId,
+        cx: AsyncApp,
     ) -> Result<Self::Response> {
-        Ok(message.and_then(SignatureHelp::new))
+        let Some(message) = message else {
+            return Ok(None);
+        };
+        cx.update(|cx| {
+            SignatureHelp::new(
+                message,
+                Some(lsp_store.read(cx).languages.clone()),
+                Some(id),
+                cx,
+            )
+        })
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> Self::ProtoRequest {
+        let offset = buffer.point_utf16_to_offset(self.position);
+        proto::GetSignatureHelp {
+            project_id,
+            buffer_id: buffer.remote_id().to_proto(),
+            position: Some(serialize_anchor(&buffer.anchor_after(offset))),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        payload: Self::ProtoRequest,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&payload.version))
+            })?
+            .await
+            .with_context(|| format!("waiting for version for buffer {}", buffer.entity_id()))?;
+        let buffer_snapshot = buffer.read_with(&cx, |buffer, _| buffer.snapshot())?;
+        Ok(Self {
+            position: payload
+                .position
+                .and_then(deserialize_anchor)
+                .context("invalid position")?
+                .to_point_utf16(&buffer_snapshot),
+        })
+    }
+
+    fn response_to_proto(
+        response: Self::Response,
+        _: &mut LspStore,
+        _: PeerId,
+        _: &Global,
+        _: &mut App,
+    ) -> proto::GetSignatureHelpResponse {
+        proto::GetSignatureHelpResponse {
+            signature_help: response
+                .map(|signature_help| lsp_to_proto_signature(signature_help.original_data)),
+        }
+    }
+
+    async fn response_from_proto(
+        self,
+        response: proto::GetSignatureHelpResponse,
+        lsp_store: Entity<LspStore>,
+        _: Entity<Buffer>,
+        cx: AsyncApp,
+    ) -> Result<Self::Response> {
+        cx.update(|cx| {
+            response
+                .signature_help
+                .map(proto_to_lsp_signature)
+                .and_then(|signature| {
+                    SignatureHelp::new(
+                        signature,
+                        Some(lsp_store.read(cx).languages.clone()),
+                        None,
+                        cx,
+                    )
+                })
+        })
+    }
+
+    fn buffer_id_from_proto(message: &Self::ProtoRequest) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
     }
 }
 
@@ -968,13 +1678,13 @@ impl LspCommand for GetHover {
         _: Entity<LspStore>,
         buffer: Entity<Buffer>,
         _: LanguageServerId,
-        mut cx: AsyncApp,
+        cx: AsyncApp,
     ) -> Result<Self::Response> {
         let Some(hover) = message else {
             return Ok(None);
         };
 
-        let (language, range) = buffer.read_with(&mut cx, |buffer, _| {
+        let (language, range) = buffer.read_with(&cx, |buffer, _| {
             (
                 buffer.language().cloned(),
                 hover.range.map(|range| {
@@ -1032,15 +1742,159 @@ impl LspCommand for GetHover {
             language,
         }))
     }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> Self::ProtoRequest {
+        proto::GetHover {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            version: serialize_version(&buffer.version),
+        }
+    }
+
+    async fn from_proto(
+        message: Self::ProtoRequest,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: Self::Response,
+        _: &mut LspStore,
+        _: PeerId,
+        _: &clock::Global,
+        _: &mut App,
+    ) -> proto::GetHoverResponse {
+        if let Some(response) = response {
+            let (start, end) = if let Some(range) = response.range {
+                (
+                    Some(language::proto::serialize_anchor(&range.start)),
+                    Some(language::proto::serialize_anchor(&range.end)),
+                )
+            } else {
+                (None, None)
+            };
+
+            let contents = response
+                .contents
+                .into_iter()
+                .map(|block| proto::HoverBlock {
+                    text: block.text,
+                    is_markdown: block.kind == HoverBlockKind::Markdown,
+                    language: if let HoverBlockKind::Code { language } = block.kind {
+                        Some(language)
+                    } else {
+                        None
+                    },
+                })
+                .collect();
+
+            proto::GetHoverResponse {
+                start,
+                end,
+                contents,
+            }
+        } else {
+            proto::GetHoverResponse {
+                start: None,
+                end: None,
+                contents: Vec::new(),
+            }
+        }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::GetHoverResponse,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self::Response> {
+        let contents: Vec<_> = message
+            .contents
+            .into_iter()
+            .map(|block| HoverBlock {
+                text: block.text,
+                kind: if let Some(language) = block.language {
+                    HoverBlockKind::Code { language }
+                } else if block.is_markdown {
+                    HoverBlockKind::Markdown
+                } else {
+                    HoverBlockKind::PlainText
+                },
+            })
+            .collect();
+        if contents.is_empty() {
+            return Ok(None);
+        }
+
+        let language = buffer.read_with(&cx, |buffer, _| buffer.language().cloned())?;
+        let range = if let (Some(start), Some(end)) = (message.start, message.end) {
+            language::proto::deserialize_anchor(start)
+                .and_then(|start| language::proto::deserialize_anchor(end).map(|end| start..end))
+        } else {
+            None
+        };
+        if let Some(range) = range.as_ref() {
+            buffer
+                .update(&mut cx, |buffer, _| {
+                    buffer.wait_for_anchors([range.start, range.end])
+                })?
+                .await?;
+        }
+
+        Ok(Some(Hover {
+            contents,
+            range,
+            language,
+        }))
+    }
+
+    fn buffer_id_from_proto(message: &Self::ProtoRequest) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
+    }
+}
+
+impl GetCompletions {
+    pub fn can_resolve_completions(capabilities: &lsp::ServerCapabilities) -> bool {
+        capabilities
+            .completion_provider
+            .as_ref()
+            .and_then(|options| options.resolve_provider)
+            .unwrap_or(false)
+    }
 }
 
 #[async_trait(?Send)]
 impl LspCommand for GetCompletions {
-    type Response = Vec<CoreCompletion>;
+    type Response = CoreCompletionResponse;
     type LspRequest = lsp::request::Completion;
 
     fn display_name(&self) -> &str {
         "Get completion"
+    }
+
+    fn check_capabilities(&self, capabilities: AdapterServerCapabilities) -> bool {
+        capabilities
+            .server_capabilities
+            .completion_provider
+            .is_some()
     }
 
     fn to_lsp(
@@ -1066,19 +1920,25 @@ impl LspCommand for GetCompletions {
         server_id: LanguageServerId,
         mut cx: AsyncApp,
     ) -> Result<Self::Response> {
-        let mut completions = if let Some(completions) = completions {
+        let mut response_list = None;
+        let (mut completions, mut is_incomplete) = if let Some(completions) = completions {
             match completions {
-                lsp::CompletionResponse::Array(completions) => completions,
+                lsp::CompletionResponse::Array(completions) => (completions, false),
                 lsp::CompletionResponse::List(mut list) => {
-                    std::mem::take(&mut list.items)
+                    let is_incomplete = list.is_incomplete;
+                    let items = std::mem::take(&mut list.items);
+                    response_list = Some(list);
+                    (items, is_incomplete)
                 }
             }
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
 
+        let unfiltered_completions_count = completions.len();
+
         let language_server_adapter = lsp_store
-            .read_with(&mut cx, |lsp_store, _| {
+            .read_with(&cx, |lsp_store, _| {
                 lsp_store.language_server_adapter_for_id(server_id)
             })?
             .with_context(|| format!("no language server with id {server_id}"))?;
@@ -1090,7 +1950,32 @@ impl LspCommand for GetCompletions {
 
             let mut range_for_token = None;
             completions.retain(|lsp_completion| {
-                let lsp_edit = lsp_completion.text_edit.clone();
+                let lsp_edit = lsp_completion.text_edit.clone().or_else(|| {
+                    let default_text_edit = lsp_defaults.as_deref()?.edit_range.as_ref()?;
+                    let new_text = lsp_completion
+                        .text_edit_text
+                        .as_ref()
+                        .unwrap_or(&lsp_completion.label)
+                        .clone();
+                    match default_text_edit {
+                        CompletionListItemDefaultsEditRange::Range(range) => {
+                            Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+                                range: *range,
+                                new_text,
+                            }))
+                        }
+                        CompletionListItemDefaultsEditRange::InsertAndReplace {
+                            insert,
+                            replace,
+                        } => Some(lsp::CompletionTextEdit::InsertAndReplace(
+                            lsp::InsertReplaceEdit {
+                                new_text,
+                                insert: *insert,
+                                replace: *replace,
+                            },
+                        )),
+                    }
+                });
 
                 let edit = match lsp_edit {
                     // If the language server provides a range to overwrite, then
@@ -1105,7 +1990,7 @@ impl LspCommand for GetCompletions {
                     // the range based on the syntax tree.
                     None => {
                         if self.position != clipped_position {
-                            log::info!("completion out of expected range");
+                            log::info!("completion out of expected range ");
                             return false;
                         }
 
@@ -1119,9 +2004,35 @@ impl LspCommand for GetCompletions {
                                     offset..offset
                                 };
 
-                                snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end)
-                            })
-                            .clone();
+                        let range = if let Some(range) = default_edit_range {
+                            let range = range_from_lsp(*range);
+                            let start = snapshot.clip_point_utf16(range.start, Bias::Left);
+                            let end = snapshot.clip_point_utf16(range.end, Bias::Left);
+                            if start != range.start.0 || end != range.end.0 {
+                                log::info!("completion out of expected range");
+                                return false;
+                            }
+
+                            snapshot.anchor_before(start)..snapshot.anchor_after(end)
+                        } else {
+                            range_for_token
+                                .get_or_insert_with(|| {
+                                    let offset = self.position.to_offset(&snapshot);
+                                    let (range, kind) = snapshot.surrounding_word(
+                                        offset,
+                                        Some(CharScopeContext::Completion),
+                                    );
+                                    let range = if kind == Some(CharKind::Word) {
+                                        range
+                                    } else {
+                                        offset..offset
+                                    };
+
+                                    snapshot.anchor_before(range.start)
+                                        ..snapshot.anchor_after(range.end)
+                                })
+                                .clone()
+                        };
 
                         // We already know text_edit is None here
                         let text = lsp_completion
@@ -1143,15 +2054,30 @@ impl LspCommand for GetCompletions {
             });
         })?;
 
+        // If completions were filtered out due to errors that may be transient, mark the result
+        // incomplete so that it is re-queried.
+        if unfiltered_completions_count != completions.len() {
+            is_incomplete = true;
+        }
+
         language_server_adapter
             .process_completions(&mut completions)
             .await;
 
-        Ok(completions
+        let completions = completions
             .into_iter()
             .zip(completion_edits)
             .map(|(lsp_completion, mut edit)| {
                 LineEnding::normalize(&mut edit.new_text);
+                if lsp_completion.data.is_none()
+                    && let Some(default_data) = lsp_defaults
+                        .as_ref()
+                        .and_then(|item_defaults| item_defaults.data.clone())
+                {
+                    // Servers (e.g. JDTLS) prefer unchanged completions, when resolving the items later,
+                    // so we do not insert the defaults here, but `data` is needed for resolving, so this is an exception.
+                    lsp_completion.data = Some(default_data);
+                }
                 CoreCompletion {
                     replace_range: edit.replace_range,
                     new_text: edit.new_text,
@@ -1163,7 +2089,101 @@ impl LspCommand for GetCompletions {
                     },
                 }
             })
-            .collect())
+            .collect();
+
+        Ok(CoreCompletionResponse {
+            completions,
+            is_incomplete,
+        })
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetCompletions {
+        let anchor = buffer.anchor_after(self.position);
+        proto::GetCompletions {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(&anchor)),
+            version: serialize_version(&buffer.version()),
+            server_id: self.server_id.map(|id| id.to_proto()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::GetCompletions,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        let version = deserialize_version(&message.version);
+        buffer
+            .update(&mut cx, |buffer, _| buffer.wait_for_version(version))?
+            .await?;
+        let position = message
+            .position
+            .and_then(language::proto::deserialize_anchor)
+            .map(|p| {
+                buffer.read_with(&cx, |buffer, _| {
+                    buffer.clip_point_utf16(Unclipped(p.to_point_utf16(buffer)), Bias::Left)
+                })
+            })
+            .context("invalid position")??;
+        Ok(Self {
+            position,
+            context: CompletionContext {
+                trigger_kind: CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            server_id: message
+                .server_id
+                .map(|id| lsp::LanguageServerId::from_proto(id)),
+        })
+    }
+
+    fn response_to_proto(
+        response: CoreCompletionResponse,
+        _: &mut LspStore,
+        _: PeerId,
+        buffer_version: &clock::Global,
+        _: &mut App,
+    ) -> proto::GetCompletionsResponse {
+        proto::GetCompletionsResponse {
+            completions: response
+                .completions
+                .iter()
+                .map(LspStore::serialize_completion)
+                .collect(),
+            version: serialize_version(buffer_version),
+            can_reuse: !response.is_incomplete,
+        }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::GetCompletionsResponse,
+        _project: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self::Response> {
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+
+        let completions = message
+            .completions
+            .into_iter()
+            .map(LspStore::deserialize_completion)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(CoreCompletionResponse {
+            completions,
+            is_incomplete: !message.can_reuse,
+        })
+    }
+
+    fn buffer_id_from_proto(message: &proto::GetCompletions) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
     }
 }
 
@@ -1189,7 +2209,9 @@ pub(crate) fn parse_completion_text_edit(
         let start = snapshot.clip_point_utf16(range.start, Bias::Left);
         let end = snapshot.clip_point_utf16(range.end, Bias::Left);
         if start != range.start.0 || end != range.end.0 {
-            log::info!("completion out of expected range");
+            log::info!(
+                "completion out of expected range, start: {start:?}, end: {end:?}, range: {range:?}"
+            );
             return None;
         }
         snapshot.anchor_before(start)..snapshot.anchor_after(end)
@@ -1210,8 +2232,8 @@ pub(crate) fn parse_completion_text_edit(
     };
 
     Some(ParsedCompletionEdit {
-        insert_range: insert_range,
-        replace_range: replace_range,
+        insert_range,
+        replace_range,
         new_text: new_text.clone(),
     })
 }
@@ -1303,11 +2325,9 @@ impl LspCommand for GetCodeActions {
         server_id: LanguageServerId,
         cx: AsyncApp,
     ) -> Result<Vec<CodeAction>> {
-        let requested_kinds_set = if let Some(kinds) = self.kinds {
-            Some(kinds.into_iter().collect::<HashSet<_>>())
-        } else {
-            None
-        };
+        let requested_kinds_set = self
+            .kinds
+            .map(|kinds| kinds.into_iter().collect::<HashSet<_>>());
 
         let language_server = cx.update(|cx| {
             lsp_store
@@ -1330,10 +2350,10 @@ impl LspCommand for GetCodeActions {
             .filter_map(|entry| {
                 let (lsp_action, resolved) = match entry {
                     lsp::CodeActionOrCommand::CodeAction(lsp_action) => {
-                        if let Some(command) = lsp_action.command.as_ref() {
-                            if !available_commands.contains(&command.command) {
-                                return None;
-                            }
+                        if let Some(command) = lsp_action.command.as_ref()
+                            && !available_commands.contains(&command.command)
+                        {
+                            return None;
                         }
                         (LspAction::Action(Box::new(lsp_action)), false)
                     }
@@ -1348,10 +2368,9 @@ impl LspCommand for GetCodeActions {
 
                 if let Some((requested_kinds, kind)) =
                     requested_kinds_set.as_ref().zip(lsp_action.action_kind())
+                    && !requested_kinds.contains(&kind)
                 {
-                    if !requested_kinds.contains(&kind) {
-                        return None;
-                    }
+                    return None;
                 }
 
                 Some(CodeAction {
@@ -1373,7 +2392,7 @@ impl GetCodeActions {
             Some(lsp::CodeActionProviderCapability::Options(CodeActionOptions {
                 code_action_kinds: Some(supported_action_kinds),
                 ..
-            })) => Some(supported_action_kinds.clone()),
+            })) => Some(supported_action_kinds),
             _ => capabilities.code_action_kinds,
         }
     }
@@ -1390,6 +2409,23 @@ impl GetCodeActions {
     }
 }
 
+impl OnTypeFormatting {
+    pub fn supports_on_type_formatting(trigger: &str, capabilities: &ServerCapabilities) -> bool {
+        let Some(on_type_formatting_options) = &capabilities.document_on_type_formatting_provider
+        else {
+            return false;
+        };
+        on_type_formatting_options
+            .first_trigger_character
+            .contains(trigger)
+            || on_type_formatting_options
+                .more_trigger_character
+                .iter()
+                .flatten()
+                .any(|chars| chars.contains(trigger))
+    }
+}
+
 #[async_trait(?Send)]
 impl LspCommand for OnTypeFormatting {
     type Response = Option<Transaction>;
@@ -1400,20 +2436,7 @@ impl LspCommand for OnTypeFormatting {
     }
 
     fn check_capabilities(&self, capabilities: AdapterServerCapabilities) -> bool {
-        let Some(on_type_formatting_options) = &capabilities
-            .server_capabilities
-            .document_on_type_formatting_provider
-        else {
-            return false;
-        };
-        on_type_formatting_options
-            .first_trigger_character
-            .contains(&self.trigger)
-            || on_type_formatting_options
-                .more_trigger_character
-                .iter()
-                .flatten()
-                .any(|chars| chars.contains(&self.trigger))
+        Self::supports_on_type_formatting(&self.trigger, &capabilities.server_capabilities)
     }
 
     fn to_lsp(
@@ -1454,6 +2477,78 @@ impl LspCommand for OnTypeFormatting {
         } else {
             Ok(None)
         }
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::OnTypeFormatting {
+        proto::OnTypeFormatting {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            trigger: self.trigger.clone(),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::OnTypeFormatting,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .context("invalid position")?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+
+        let options = buffer.update(&mut cx, |buffer, cx| {
+            lsp_formatting_options(
+                language_settings(buffer.language().map(|l| l.name()), buffer.file(), cx).as_ref(),
+            )
+        })?;
+
+        Ok(Self {
+            position: buffer.read_with(&cx, |buffer, _| position.to_point_utf16(buffer))?,
+            trigger: message.trigger.clone(),
+            options,
+            push_to_history: false,
+        })
+    }
+
+    fn response_to_proto(
+        response: Option<Transaction>,
+        _: &mut LspStore,
+        _: PeerId,
+        _: &clock::Global,
+        _: &mut App,
+    ) -> proto::OnTypeFormattingResponse {
+        proto::OnTypeFormattingResponse {
+            transaction: response
+                .map(|transaction| language::proto::serialize_transaction(&transaction)),
+        }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::OnTypeFormattingResponse,
+        _: Entity<LspStore>,
+        _: Entity<Buffer>,
+        _: AsyncApp,
+    ) -> Result<Option<Transaction>> {
+        let Some(transaction) = message.transaction else {
+            return Ok(None);
+        };
+        Ok(Some(language::proto::deserialize_transaction(transaction)?))
+    }
+
+    fn buffer_id_from_proto(message: &proto::OnTypeFormatting) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
     }
 }
 
@@ -1546,6 +2641,202 @@ impl InlayHints {
         Ok(label)
     }
 
+    pub fn project_to_proto_hint(response_hint: InlayHint) -> proto::InlayHint {
+        let (state, lsp_resolve_state) = match response_hint.resolve_state {
+            ResolveState::Resolved => (0, None),
+            ResolveState::CanResolve(server_id, resolve_data) => (
+                1,
+                Some(proto::resolve_state::LspResolveState {
+                    server_id: server_id.0 as u64,
+                    value: resolve_data.map(|json_data| {
+                        serde_json::to_string(&json_data)
+                            .expect("failed to serialize resolve json data")
+                    }),
+                }),
+            ),
+            ResolveState::Resolving => (2, None),
+        };
+        let resolve_state = Some(proto::ResolveState {
+            state,
+            lsp_resolve_state,
+        });
+        proto::InlayHint {
+            position: Some(language::proto::serialize_anchor(&response_hint.position)),
+            padding_left: response_hint.padding_left,
+            padding_right: response_hint.padding_right,
+            label: Some(proto::InlayHintLabel {
+                label: Some(match response_hint.label {
+                    InlayHintLabel::String(s) => proto::inlay_hint_label::Label::Value(s),
+                    InlayHintLabel::LabelParts(label_parts) => {
+                        proto::inlay_hint_label::Label::LabelParts(proto::InlayHintLabelParts {
+                            parts: label_parts.into_iter().map(|label_part| {
+                                let location_url = label_part.location.as_ref().map(|(_, location)| location.uri.to_string());
+                                let location_range_start = label_part.location.as_ref().map(|(_, location)| point_from_lsp(location.range.start).0).map(|point| proto::PointUtf16 { row: point.row, column: point.column });
+                                let location_range_end = label_part.location.as_ref().map(|(_, location)| point_from_lsp(location.range.end).0).map(|point| proto::PointUtf16 { row: point.row, column: point.column });
+                                proto::InlayHintLabelPart {
+                                value: label_part.value,
+                                tooltip: label_part.tooltip.map(|tooltip| {
+                                    let proto_tooltip = match tooltip {
+                                        InlayHintLabelPartTooltip::String(s) => proto::inlay_hint_label_part_tooltip::Content::Value(s),
+                                        InlayHintLabelPartTooltip::MarkupContent(markup_content) => proto::inlay_hint_label_part_tooltip::Content::MarkupContent(proto::MarkupContent {
+                                            is_markdown: markup_content.kind == HoverBlockKind::Markdown,
+                                            value: markup_content.value,
+                                        }),
+                                    };
+                                    proto::InlayHintLabelPartTooltip {content: Some(proto_tooltip)}
+                                }),
+                                location_url,
+                                location_range_start,
+                                location_range_end,
+                                language_server_id: label_part.location.as_ref().map(|(server_id, _)| server_id.0 as u64),
+                            }}).collect()
+                        })
+                    }
+                }),
+            }),
+            kind: response_hint.kind.map(|kind| kind.name().to_string()),
+            tooltip: response_hint.tooltip.map(|response_tooltip| {
+                let proto_tooltip = match response_tooltip {
+                    InlayHintTooltip::String(s) => proto::inlay_hint_tooltip::Content::Value(s),
+                    InlayHintTooltip::MarkupContent(markup_content) => {
+                        proto::inlay_hint_tooltip::Content::MarkupContent(proto::MarkupContent {
+                            is_markdown: markup_content.kind == HoverBlockKind::Markdown,
+                            value: markup_content.value,
+                        })
+                    }
+                };
+                proto::InlayHintTooltip {
+                    content: Some(proto_tooltip),
+                }
+            }),
+            resolve_state,
+        }
+    }
+
+    pub fn proto_to_project_hint(message_hint: proto::InlayHint) -> anyhow::Result<InlayHint> {
+        let resolve_state = message_hint.resolve_state.as_ref().unwrap_or_else(|| {
+            panic!("incorrect proto inlay hint message: no resolve state in hint {message_hint:?}",)
+        });
+        let resolve_state_data = resolve_state
+            .lsp_resolve_state.as_ref()
+            .map(|lsp_resolve_state| {
+                let value = lsp_resolve_state.value.as_deref().map(|value| {
+                    serde_json::from_str::<Option<lsp::LSPAny>>(value)
+                        .with_context(|| format!("incorrect proto inlay hint message: non-json resolve state {lsp_resolve_state:?}"))
+                }).transpose()?.flatten();
+                anyhow::Ok((LanguageServerId(lsp_resolve_state.server_id as usize), value))
+            })
+            .transpose()?;
+        let resolve_state = match resolve_state.state {
+            0 => ResolveState::Resolved,
+            1 => {
+                let (server_id, lsp_resolve_state) = resolve_state_data.with_context(|| {
+                    format!(
+                        "No lsp resolve data for the hint that can be resolved: {message_hint:?}"
+                    )
+                })?;
+                ResolveState::CanResolve(server_id, lsp_resolve_state)
+            }
+            2 => ResolveState::Resolving,
+            invalid => {
+                anyhow::bail!("Unexpected resolve state {invalid} for hint {message_hint:?}")
+            }
+        };
+        Ok(InlayHint {
+            position: message_hint
+                .position
+                .and_then(language::proto::deserialize_anchor)
+                .context("invalid position")?,
+            label: match message_hint
+                .label
+                .and_then(|label| label.label)
+                .context("missing label")?
+            {
+                proto::inlay_hint_label::Label::Value(s) => InlayHintLabel::String(s),
+                proto::inlay_hint_label::Label::LabelParts(parts) => {
+                    let mut label_parts = Vec::new();
+                    for part in parts.parts {
+                        label_parts.push(InlayHintLabelPart {
+                            value: part.value,
+                            tooltip: part.tooltip.map(|tooltip| match tooltip.content {
+                                Some(proto::inlay_hint_label_part_tooltip::Content::Value(s)) => {
+                                    InlayHintLabelPartTooltip::String(s)
+                                }
+                                Some(
+                                    proto::inlay_hint_label_part_tooltip::Content::MarkupContent(
+                                        markup_content,
+                                    ),
+                                ) => InlayHintLabelPartTooltip::MarkupContent(MarkupContent {
+                                    kind: if markup_content.is_markdown {
+                                        HoverBlockKind::Markdown
+                                    } else {
+                                        HoverBlockKind::PlainText
+                                    },
+                                    value: markup_content.value,
+                                }),
+                                None => InlayHintLabelPartTooltip::String(String::new()),
+                            }),
+                            location: {
+                                match part
+                                    .location_url
+                                    .zip(
+                                        part.location_range_start.and_then(|start| {
+                                            Some(start..part.location_range_end?)
+                                        }),
+                                    )
+                                    .zip(part.language_server_id)
+                                {
+                                    Some(((uri, range), server_id)) => Some((
+                                        LanguageServerId(server_id as usize),
+                                        lsp::Location {
+                                            uri: lsp::Uri::from_str(&uri)
+                                                .context("invalid uri in hint part {part:?}")?,
+                                            range: lsp::Range::new(
+                                                point_to_lsp(PointUtf16::new(
+                                                    range.start.row,
+                                                    range.start.column,
+                                                )),
+                                                point_to_lsp(PointUtf16::new(
+                                                    range.end.row,
+                                                    range.end.column,
+                                                )),
+                                            ),
+                                        },
+                                    )),
+                                    None => None,
+                                }
+                            },
+                        });
+                    }
+
+                    InlayHintLabel::LabelParts(label_parts)
+                }
+            },
+            padding_left: message_hint.padding_left,
+            padding_right: message_hint.padding_right,
+            kind: message_hint
+                .kind
+                .as_deref()
+                .and_then(InlayHintKind::from_name),
+            tooltip: message_hint.tooltip.and_then(|tooltip| {
+                Some(match tooltip.content? {
+                    proto::inlay_hint_tooltip::Content::Value(s) => InlayHintTooltip::String(s),
+                    proto::inlay_hint_tooltip::Content::MarkupContent(markup_content) => {
+                        InlayHintTooltip::MarkupContent(MarkupContent {
+                            kind: if markup_content.is_markdown {
+                                HoverBlockKind::Markdown
+                            } else {
+                                HoverBlockKind::PlainText
+                            },
+                            value: markup_content.value,
+                        })
+                    }
+                })
+            }),
+            resolve_state,
+        })
+    }
+
     pub fn project_to_lsp_hint(hint: InlayHint, snapshot: &BufferSnapshot) -> lsp::InlayHint {
         lsp::InlayHint {
             position: point_to_lsp(hint.position.to_point_utf16(snapshot)),
@@ -1629,6 +2920,16 @@ impl InlayHints {
             })
             .unwrap_or(false)
     }
+
+    pub fn check_capabilities(capabilities: &ServerCapabilities) -> bool {
+        capabilities
+            .inlay_hint_provider
+            .as_ref()
+            .is_some_and(|inlay_hint_provider| match inlay_hint_provider {
+                lsp::OneOf::Left(enabled) => *enabled,
+                lsp::OneOf::Right(_) => true,
+            })
+    }
 }
 
 #[async_trait(?Send)]
@@ -1641,17 +2942,7 @@ impl LspCommand for InlayHints {
     }
 
     fn check_capabilities(&self, capabilities: AdapterServerCapabilities) -> bool {
-        let Some(inlay_hint_provider) = &capabilities.server_capabilities.inlay_hint_provider
-        else {
-            return false;
-        };
-        match inlay_hint_provider {
-            lsp::OneOf::Left(enabled) => *enabled,
-            lsp::OneOf::Right(inlay_hint_capabilities) => match inlay_hint_capabilities {
-                lsp::InlayHintServerCapabilities::Options(_) => true,
-                lsp::InlayHintServerCapabilities::RegistrationOptions(_) => false,
-            },
-        }
+        Self::check_capabilities(&capabilities.server_capabilities)
     }
 
     fn to_lsp(
@@ -1731,10 +3022,7 @@ impl LspCommand for GetCodeLens {
         capabilities
             .server_capabilities
             .code_lens_provider
-            .as_ref()
-            .map_or(false, |code_lens_options| {
-                code_lens_options.resolve_provider.unwrap_or(false)
-            })
+            .is_some()
     }
 
     fn to_lsp(
@@ -1759,9 +3047,9 @@ impl LspCommand for GetCodeLens {
         lsp_store: Entity<LspStore>,
         buffer: Entity<Buffer>,
         server_id: LanguageServerId,
-        mut cx: AsyncApp,
+        cx: AsyncApp,
     ) -> anyhow::Result<Vec<CodeAction>> {
-        let snapshot = buffer.read_with(&mut cx, |buffer, _| buffer.snapshot())?;
+        let snapshot = buffer.read_with(&cx, |buffer, _| buffer.snapshot())?;
         let language_server = cx.update(|cx| {
             lsp_store
                 .read(cx)
@@ -1801,6 +3089,18 @@ impl LspCommand for GetCodeLens {
     }
 }
 
+impl LinkedEditingRange {
+    pub fn check_server_capabilities(capabilities: ServerCapabilities) -> bool {
+        let Some(linked_editing_options) = capabilities.linked_editing_range_provider else {
+            return false;
+        };
+        if let LinkedEditingRangeServerCapabilities::Simple(false) = linked_editing_options {
+            return false;
+        }
+        true
+    }
+}
+
 #[async_trait(?Send)]
 impl LspCommand for LinkedEditingRange {
     type Response = Vec<Range<Anchor>>;
@@ -1811,16 +3111,7 @@ impl LspCommand for LinkedEditingRange {
     }
 
     fn check_capabilities(&self, capabilities: AdapterServerCapabilities) -> bool {
-        let Some(linked_editing_options) = &capabilities
-            .server_capabilities
-            .linked_editing_range_provider
-        else {
-            return false;
-        };
-        if let LinkedEditingRangeServerCapabilities::Simple(false) = linked_editing_options {
-            return false;
-        }
-        true
+        Self::check_server_capabilities(capabilities.server_capabilities)
     }
 
     fn to_lsp(
@@ -1862,5 +3153,900 @@ impl LspCommand for LinkedEditingRange {
         } else {
             Ok(vec![])
         }
+    }
+}
+
+impl GetDocumentDiagnostics {
+    pub fn diagnostics_from_proto(
+        response: proto::GetDocumentDiagnosticsResponse,
+    ) -> Vec<LspPullDiagnostics> {
+        response
+            .pulled_diagnostics
+            .into_iter()
+            .filter_map(|diagnostics| {
+                Some(LspPullDiagnostics::Response {
+                    registration_id: diagnostics.registration_id.map(SharedString::from),
+                    server_id: LanguageServerId::from_proto(diagnostics.server_id),
+                    uri: lsp::Uri::from_str(diagnostics.uri.as_str()).log_err()?,
+                    diagnostics: if diagnostics.changed {
+                        PulledDiagnostics::Unchanged {
+                            result_id: SharedString::new(diagnostics.result_id?),
+                        }
+                    } else {
+                        PulledDiagnostics::Changed {
+                            result_id: diagnostics.result_id.map(SharedString::new),
+                            diagnostics: diagnostics
+                                .diagnostics
+                                .into_iter()
+                                .filter_map(|diagnostic| {
+                                    GetDocumentDiagnostics::deserialize_lsp_diagnostic(diagnostic)
+                                        .context("deserializing diagnostics")
+                                        .log_err()
+                                })
+                                .collect(),
+                        }
+                    },
+                })
+            })
+            .collect()
+    }
+
+    fn deserialize_lsp_diagnostic(diagnostic: proto::LspDiagnostic) -> Result<lsp::Diagnostic> {
+        let start = diagnostic.start.context("invalid start range")?;
+        let end = diagnostic.end.context("invalid end range")?;
+
+        let range = Range::<PointUtf16> {
+            start: PointUtf16 {
+                row: start.row,
+                column: start.column,
+            },
+            end: PointUtf16 {
+                row: end.row,
+                column: end.column,
+            },
+        };
+
+        let data = diagnostic.data.and_then(|data| Value::from_str(&data).ok());
+        let code = diagnostic.code.map(lsp::NumberOrString::String);
+
+        let related_information = diagnostic
+            .related_information
+            .into_iter()
+            .map(|info| {
+                let start = info.location_range_start.unwrap();
+                let end = info.location_range_end.unwrap();
+
+                lsp::DiagnosticRelatedInformation {
+                    location: lsp::Location {
+                        range: lsp::Range {
+                            start: point_to_lsp(PointUtf16::new(start.row, start.column)),
+                            end: point_to_lsp(PointUtf16::new(end.row, end.column)),
+                        },
+                        uri: lsp::Uri::from_str(&info.location_url.unwrap()).unwrap(),
+                    },
+                    message: info.message,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let tags = diagnostic
+            .tags
+            .into_iter()
+            .filter_map(|tag| match proto::LspDiagnosticTag::from_i32(tag) {
+                Some(proto::LspDiagnosticTag::Unnecessary) => Some(lsp::DiagnosticTag::UNNECESSARY),
+                Some(proto::LspDiagnosticTag::Deprecated) => Some(lsp::DiagnosticTag::DEPRECATED),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        Ok(lsp::Diagnostic {
+            range: language::range_to_lsp(range)?,
+            severity: match proto::lsp_diagnostic::Severity::from_i32(diagnostic.severity).unwrap()
+            {
+                proto::lsp_diagnostic::Severity::Error => Some(lsp::DiagnosticSeverity::ERROR),
+                proto::lsp_diagnostic::Severity::Warning => Some(lsp::DiagnosticSeverity::WARNING),
+                proto::lsp_diagnostic::Severity::Information => {
+                    Some(lsp::DiagnosticSeverity::INFORMATION)
+                }
+                proto::lsp_diagnostic::Severity::Hint => Some(lsp::DiagnosticSeverity::HINT),
+                _ => None,
+            },
+            code,
+            code_description: diagnostic
+                .code_description
+                .map(|code_description| CodeDescription {
+                    href: Some(lsp::Uri::from_str(&code_description).unwrap()),
+                }),
+            related_information: Some(related_information),
+            tags: Some(tags),
+            source: diagnostic.source.clone(),
+            message: diagnostic.message,
+            data,
+        })
+    }
+
+    fn serialize_lsp_diagnostic(diagnostic: lsp::Diagnostic) -> Result<proto::LspDiagnostic> {
+        let range = language::range_from_lsp(diagnostic.range);
+        let related_information = diagnostic
+            .related_information
+            .unwrap_or_default()
+            .into_iter()
+            .map(|related_information| {
+                let location_range_start =
+                    point_from_lsp(related_information.location.range.start).0;
+                let location_range_end = point_from_lsp(related_information.location.range.end).0;
+
+                Ok(proto::LspDiagnosticRelatedInformation {
+                    location_url: Some(related_information.location.uri.to_string()),
+                    location_range_start: Some(proto::PointUtf16 {
+                        row: location_range_start.row,
+                        column: location_range_start.column,
+                    }),
+                    location_range_end: Some(proto::PointUtf16 {
+                        row: location_range_end.row,
+                        column: location_range_end.column,
+                    }),
+                    message: related_information.message,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let tags = diagnostic
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| match tag {
+                lsp::DiagnosticTag::UNNECESSARY => proto::LspDiagnosticTag::Unnecessary,
+                lsp::DiagnosticTag::DEPRECATED => proto::LspDiagnosticTag::Deprecated,
+                _ => proto::LspDiagnosticTag::None,
+            } as i32)
+            .collect();
+
+        Ok(proto::LspDiagnostic {
+            start: Some(proto::PointUtf16 {
+                row: range.start.0.row,
+                column: range.start.0.column,
+            }),
+            end: Some(proto::PointUtf16 {
+                row: range.end.0.row,
+                column: range.end.0.column,
+            }),
+            severity: match diagnostic.severity {
+                Some(lsp::DiagnosticSeverity::ERROR) => proto::lsp_diagnostic::Severity::Error,
+                Some(lsp::DiagnosticSeverity::WARNING) => proto::lsp_diagnostic::Severity::Warning,
+                Some(lsp::DiagnosticSeverity::INFORMATION) => {
+                    proto::lsp_diagnostic::Severity::Information
+                }
+                Some(lsp::DiagnosticSeverity::HINT) => proto::lsp_diagnostic::Severity::Hint,
+                _ => proto::lsp_diagnostic::Severity::None,
+            } as i32,
+            code: diagnostic.code.as_ref().map(|code| match code {
+                lsp::NumberOrString::Number(code) => code.to_string(),
+                lsp::NumberOrString::String(code) => code.clone(),
+            }),
+            source: diagnostic.source.clone(),
+            related_information,
+            tags,
+            code_description: diagnostic
+                .code_description
+                .and_then(|desc| desc.href.map(|url| url.to_string())),
+            message: diagnostic.message,
+            data: diagnostic.data.as_ref().map(|data| data.to_string()),
+        })
+    }
+
+    pub fn deserialize_workspace_diagnostics_report(
+        report: lsp::WorkspaceDiagnosticReportResult,
+        server_id: LanguageServerId,
+        registration_id: Option<SharedString>,
+    ) -> Vec<WorkspaceLspPullDiagnostics> {
+        let mut pulled_diagnostics = HashMap::default();
+        match report {
+            lsp::WorkspaceDiagnosticReportResult::Report(workspace_diagnostic_report) => {
+                for report in workspace_diagnostic_report.items {
+                    match report {
+                        lsp::WorkspaceDocumentDiagnosticReport::Full(report) => {
+                            process_full_workspace_diagnostics_report(
+                                &mut pulled_diagnostics,
+                                server_id,
+                                report,
+                                registration_id.clone(),
+                            )
+                        }
+                        lsp::WorkspaceDocumentDiagnosticReport::Unchanged(report) => {
+                            process_unchanged_workspace_diagnostics_report(
+                                &mut pulled_diagnostics,
+                                server_id,
+                                report,
+                                registration_id.clone(),
+                            )
+                        }
+                    }
+                }
+            }
+            lsp::WorkspaceDiagnosticReportResult::Partial(
+                workspace_diagnostic_report_partial_result,
+            ) => {
+                for report in workspace_diagnostic_report_partial_result.items {
+                    match report {
+                        lsp::WorkspaceDocumentDiagnosticReport::Full(report) => {
+                            process_full_workspace_diagnostics_report(
+                                &mut pulled_diagnostics,
+                                server_id,
+                                report,
+                                registration_id.clone(),
+                            )
+                        }
+                        lsp::WorkspaceDocumentDiagnosticReport::Unchanged(report) => {
+                            process_unchanged_workspace_diagnostics_report(
+                                &mut pulled_diagnostics,
+                                server_id,
+                                report,
+                                registration_id.clone(),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        pulled_diagnostics.into_values().collect()
+    }
+}
+
+#[derive(Debug)]
+pub struct WorkspaceLspPullDiagnostics {
+    pub version: Option<i32>,
+    pub diagnostics: LspPullDiagnostics,
+}
+
+fn process_full_workspace_diagnostics_report(
+    diagnostics: &mut HashMap<lsp::Uri, WorkspaceLspPullDiagnostics>,
+    server_id: LanguageServerId,
+    report: lsp::WorkspaceFullDocumentDiagnosticReport,
+    registration_id: Option<SharedString>,
+) {
+    let mut new_diagnostics = HashMap::default();
+    process_full_diagnostics_report(
+        &mut new_diagnostics,
+        server_id,
+        report.uri,
+        report.full_document_diagnostic_report,
+        registration_id,
+    );
+    diagnostics.extend(new_diagnostics.into_iter().map(|(uri, diagnostics)| {
+        (
+            uri,
+            WorkspaceLspPullDiagnostics {
+                version: report.version.map(|v| v as i32),
+                diagnostics,
+            },
+        )
+    }));
+}
+
+fn process_unchanged_workspace_diagnostics_report(
+    diagnostics: &mut HashMap<lsp::Uri, WorkspaceLspPullDiagnostics>,
+    server_id: LanguageServerId,
+    report: lsp::WorkspaceUnchangedDocumentDiagnosticReport,
+    registration_id: Option<SharedString>,
+) {
+    let mut new_diagnostics = HashMap::default();
+    process_unchanged_diagnostics_report(
+        &mut new_diagnostics,
+        server_id,
+        report.uri,
+        report.unchanged_document_diagnostic_report,
+        registration_id,
+    );
+    diagnostics.extend(new_diagnostics.into_iter().map(|(uri, diagnostics)| {
+        (
+            uri,
+            WorkspaceLspPullDiagnostics {
+                version: report.version.map(|v| v as i32),
+                diagnostics,
+            },
+        )
+    }));
+}
+
+#[async_trait(?Send)]
+impl LspCommand for GetDocumentDiagnostics {
+    type Response = Vec<LspPullDiagnostics>;
+    type LspRequest = lsp::request::DocumentDiagnosticRequest;
+    type ProtoRequest = proto::GetDocumentDiagnostics;
+
+    fn display_name(&self) -> &str {
+        "Get diagnostics"
+    }
+
+    fn check_capabilities(&self, _: AdapterServerCapabilities) -> bool {
+        true
+    }
+
+    fn to_lsp(
+        &self,
+        path: &Path,
+        _: &Buffer,
+        _: &Arc<LanguageServer>,
+        _: &App,
+    ) -> Result<lsp::DocumentDiagnosticParams> {
+        Ok(lsp::DocumentDiagnosticParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_path_to_lsp_url(path)?,
+            },
+            identifier: self.identifier.clone(),
+            previous_result_id: self.previous_result_id.clone().map(|id| id.to_string()),
+            partial_result_params: Default::default(),
+            work_done_progress_params: Default::default(),
+        })
+    }
+
+    async fn response_from_lsp(
+        self,
+        message: lsp::DocumentDiagnosticReportResult,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        server_id: LanguageServerId,
+        cx: AsyncApp,
+    ) -> Result<Self::Response> {
+        let url = buffer.read_with(&cx, |buffer, cx| {
+            buffer
+                .file()
+                .and_then(|file| file.as_local())
+                .map(|file| {
+                    let abs_path = file.abs_path(cx);
+                    file_path_to_lsp_url(&abs_path)
+                })
+                .transpose()?
+                .with_context(|| format!("missing url on buffer {}", buffer.remote_id()))
+        })??;
+
+        let mut pulled_diagnostics = HashMap::default();
+        match message {
+            lsp::DocumentDiagnosticReportResult::Report(report) => match report {
+                lsp::DocumentDiagnosticReport::Full(report) => {
+                    if let Some(related_documents) = report.related_documents {
+                        process_related_documents(
+                            &mut pulled_diagnostics,
+                            server_id,
+                            related_documents,
+                            self.registration_id.clone(),
+                        );
+                    }
+                    process_full_diagnostics_report(
+                        &mut pulled_diagnostics,
+                        server_id,
+                        url,
+                        report.full_document_diagnostic_report,
+                        self.registration_id,
+                    );
+                }
+                lsp::DocumentDiagnosticReport::Unchanged(report) => {
+                    if let Some(related_documents) = report.related_documents {
+                        process_related_documents(
+                            &mut pulled_diagnostics,
+                            server_id,
+                            related_documents,
+                            self.registration_id.clone(),
+                        );
+                    }
+                    process_unchanged_diagnostics_report(
+                        &mut pulled_diagnostics,
+                        server_id,
+                        url,
+                        report.unchanged_document_diagnostic_report,
+                        self.registration_id,
+                    );
+                }
+            },
+            lsp::DocumentDiagnosticReportResult::Partial(report) => {
+                if let Some(related_documents) = report.related_documents {
+                    process_related_documents(
+                        &mut pulled_diagnostics,
+                        server_id,
+                        related_documents,
+                        self.registration_id,
+                    );
+                }
+            }
+        }
+
+        Ok(pulled_diagnostics.into_values().collect())
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetDocumentDiagnostics {
+        proto::GetDocumentDiagnostics {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        _: proto::GetDocumentDiagnostics,
+        _: Entity<LspStore>,
+        _: Entity<Buffer>,
+        _: AsyncApp,
+    ) -> Result<Self> {
+        anyhow::bail!(
+            "proto::GetDocumentDiagnostics is not expected to be converted from proto directly, as it needs `previous_result_id` fetched first"
+        )
+    }
+
+    fn response_to_proto(
+        response: Self::Response,
+        _: &mut LspStore,
+        _: PeerId,
+        _: &clock::Global,
+        _: &mut App,
+    ) -> proto::GetDocumentDiagnosticsResponse {
+        let pulled_diagnostics = response
+            .into_iter()
+            .filter_map(|diagnostics| match diagnostics {
+                LspPullDiagnostics::Default => None,
+                LspPullDiagnostics::Response {
+                    server_id,
+                    uri,
+                    diagnostics,
+                    registration_id,
+                } => {
+                    let mut changed = false;
+                    let (diagnostics, result_id) = match diagnostics {
+                        PulledDiagnostics::Unchanged { result_id } => (Vec::new(), Some(result_id)),
+                        PulledDiagnostics::Changed {
+                            result_id,
+                            diagnostics,
+                        } => {
+                            changed = true;
+                            (diagnostics, result_id)
+                        }
+                    };
+                    Some(proto::PulledDiagnostics {
+                        changed,
+                        result_id: result_id.map(|id| id.to_string()),
+                        uri: uri.to_string(),
+                        server_id: server_id.to_proto(),
+                        diagnostics: diagnostics
+                            .into_iter()
+                            .filter_map(|diagnostic| {
+                                GetDocumentDiagnostics::serialize_lsp_diagnostic(diagnostic)
+                                    .context("serializing diagnostics")
+                                    .log_err()
+                            })
+                            .collect(),
+                        registration_id: registration_id.as_ref().map(ToString::to_string),
+                    })
+                }
+            })
+            .collect();
+
+        proto::GetDocumentDiagnosticsResponse { pulled_diagnostics }
+    }
+
+    async fn response_from_proto(
+        self,
+        response: proto::GetDocumentDiagnosticsResponse,
+        _: Entity<LspStore>,
+        _: Entity<Buffer>,
+        _: AsyncApp,
+    ) -> Result<Self::Response> {
+        Ok(Self::diagnostics_from_proto(response))
+    }
+
+    fn buffer_id_from_proto(message: &proto::GetDocumentDiagnostics) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
+    }
+}
+
+#[async_trait(?Send)]
+impl LspCommand for GetDocumentColor {
+    type Response = Vec<DocumentColor>;
+    type LspRequest = lsp::request::DocumentColor;
+    type ProtoRequest = proto::GetDocumentColor;
+
+    fn display_name(&self) -> &str {
+        "Document color"
+    }
+
+    fn check_capabilities(&self, server_capabilities: AdapterServerCapabilities) -> bool {
+        server_capabilities
+            .server_capabilities
+            .color_provider
+            .as_ref()
+            .is_some_and(|capability| match capability {
+                lsp::ColorProviderCapability::Simple(supported) => *supported,
+                lsp::ColorProviderCapability::ColorProvider(..) => true,
+                lsp::ColorProviderCapability::Options(..) => true,
+            })
+    }
+
+    fn to_lsp(
+        &self,
+        path: &Path,
+        _: &Buffer,
+        _: &Arc<LanguageServer>,
+        _: &App,
+    ) -> Result<lsp::DocumentColorParams> {
+        Ok(lsp::DocumentColorParams {
+            text_document: make_text_document_identifier(path)?,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+    }
+
+    async fn response_from_lsp(
+        self,
+        message: Vec<lsp::ColorInformation>,
+        _: Entity<LspStore>,
+        _: Entity<Buffer>,
+        _: LanguageServerId,
+        _: AsyncApp,
+    ) -> Result<Self::Response> {
+        Ok(message
+            .into_iter()
+            .map(|color| DocumentColor {
+                lsp_range: color.range,
+                color: color.color,
+                resolved: false,
+                color_presentations: Vec::new(),
+            })
+            .collect())
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> Self::ProtoRequest {
+        proto::GetDocumentColor {
+            project_id,
+            buffer_id: buffer.remote_id().to_proto(),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        _: Self::ProtoRequest,
+        _: Entity<LspStore>,
+        _: Entity<Buffer>,
+        _: AsyncApp,
+    ) -> Result<Self> {
+        Ok(Self {})
+    }
+
+    fn response_to_proto(
+        response: Self::Response,
+        _: &mut LspStore,
+        _: PeerId,
+        buffer_version: &clock::Global,
+        _: &mut App,
+    ) -> proto::GetDocumentColorResponse {
+        proto::GetDocumentColorResponse {
+            colors: response
+                .into_iter()
+                .map(|color| {
+                    let start = point_from_lsp(color.lsp_range.start).0;
+                    let end = point_from_lsp(color.lsp_range.end).0;
+                    proto::ColorInformation {
+                        red: color.color.red,
+                        green: color.color.green,
+                        blue: color.color.blue,
+                        alpha: color.color.alpha,
+                        lsp_range_start: Some(proto::PointUtf16 {
+                            row: start.row,
+                            column: start.column,
+                        }),
+                        lsp_range_end: Some(proto::PointUtf16 {
+                            row: end.row,
+                            column: end.column,
+                        }),
+                    }
+                })
+                .collect(),
+            version: serialize_version(buffer_version),
+        }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::GetDocumentColorResponse,
+        _: Entity<LspStore>,
+        _: Entity<Buffer>,
+        _: AsyncApp,
+    ) -> Result<Self::Response> {
+        Ok(message
+            .colors
+            .into_iter()
+            .filter_map(|color| {
+                let start = color.lsp_range_start?;
+                let start = PointUtf16::new(start.row, start.column);
+                let end = color.lsp_range_end?;
+                let end = PointUtf16::new(end.row, end.column);
+                Some(DocumentColor {
+                    resolved: false,
+                    color_presentations: Vec::new(),
+                    lsp_range: lsp::Range {
+                        start: point_to_lsp(start),
+                        end: point_to_lsp(end),
+                    },
+                    color: lsp::Color {
+                        red: color.red,
+                        green: color.green,
+                        blue: color.blue,
+                        alpha: color.alpha,
+                    },
+                })
+            })
+            .collect())
+    }
+
+    fn buffer_id_from_proto(message: &Self::ProtoRequest) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
+    }
+}
+
+fn process_related_documents(
+    diagnostics: &mut HashMap<lsp::Uri, LspPullDiagnostics>,
+    server_id: LanguageServerId,
+    documents: impl IntoIterator<Item = (lsp::Uri, lsp::DocumentDiagnosticReportKind)>,
+    registration_id: Option<SharedString>,
+) {
+    for (url, report_kind) in documents {
+        match report_kind {
+            lsp::DocumentDiagnosticReportKind::Full(report) => process_full_diagnostics_report(
+                diagnostics,
+                server_id,
+                url,
+                report,
+                registration_id.clone(),
+            ),
+            lsp::DocumentDiagnosticReportKind::Unchanged(report) => {
+                process_unchanged_diagnostics_report(
+                    diagnostics,
+                    server_id,
+                    url,
+                    report,
+                    registration_id.clone(),
+                )
+            }
+        }
+    }
+}
+
+fn process_unchanged_diagnostics_report(
+    diagnostics: &mut HashMap<lsp::Uri, LspPullDiagnostics>,
+    server_id: LanguageServerId,
+    uri: lsp::Uri,
+    report: lsp::UnchangedDocumentDiagnosticReport,
+    registration_id: Option<SharedString>,
+) {
+    let result_id = SharedString::new(report.result_id);
+    match diagnostics.entry(uri.clone()) {
+        hash_map::Entry::Occupied(mut o) => match o.get_mut() {
+            LspPullDiagnostics::Default => {
+                o.insert(LspPullDiagnostics::Response {
+                    server_id,
+                    uri,
+                    diagnostics: PulledDiagnostics::Unchanged { result_id },
+                    registration_id,
+                });
+            }
+            LspPullDiagnostics::Response {
+                server_id: existing_server_id,
+                uri: existing_uri,
+                diagnostics: existing_diagnostics,
+                ..
+            } => {
+                if server_id != *existing_server_id || &uri != existing_uri {
+                    debug_panic!(
+                        "Unexpected state: file {uri} has two different sets of diagnostics reported"
+                    );
+                }
+                match existing_diagnostics {
+                    PulledDiagnostics::Unchanged { .. } => {
+                        *existing_diagnostics = PulledDiagnostics::Unchanged { result_id };
+                    }
+                    PulledDiagnostics::Changed { .. } => {}
+                }
+            }
+        },
+        hash_map::Entry::Vacant(v) => {
+            v.insert(LspPullDiagnostics::Response {
+                server_id,
+                uri,
+                diagnostics: PulledDiagnostics::Unchanged { result_id },
+                registration_id,
+            });
+        }
+    }
+}
+
+fn process_full_diagnostics_report(
+    diagnostics: &mut HashMap<lsp::Uri, LspPullDiagnostics>,
+    server_id: LanguageServerId,
+    uri: lsp::Uri,
+    report: lsp::FullDocumentDiagnosticReport,
+    registration_id: Option<SharedString>,
+) {
+    let result_id = report.result_id.map(SharedString::new);
+    match diagnostics.entry(uri.clone()) {
+        hash_map::Entry::Occupied(mut o) => match o.get_mut() {
+            LspPullDiagnostics::Default => {
+                o.insert(LspPullDiagnostics::Response {
+                    server_id,
+                    uri,
+                    diagnostics: PulledDiagnostics::Changed {
+                        result_id,
+                        diagnostics: report.items,
+                    },
+                    registration_id,
+                });
+            }
+            LspPullDiagnostics::Response {
+                server_id: existing_server_id,
+                uri: existing_uri,
+                diagnostics: existing_diagnostics,
+                ..
+            } => {
+                if server_id != *existing_server_id || &uri != existing_uri {
+                    debug_panic!(
+                        "Unexpected state: file {uri} has two different sets of diagnostics reported"
+                    );
+                }
+                match existing_diagnostics {
+                    PulledDiagnostics::Unchanged { .. } => {
+                        *existing_diagnostics = PulledDiagnostics::Changed {
+                            result_id,
+                            diagnostics: report.items,
+                        };
+                    }
+                    PulledDiagnostics::Changed {
+                        result_id: existing_result_id,
+                        diagnostics: existing_diagnostics,
+                    } => {
+                        if result_id.is_some() {
+                            *existing_result_id = result_id;
+                        }
+                        existing_diagnostics.extend(report.items);
+                    }
+                }
+            }
+        },
+        hash_map::Entry::Vacant(v) => {
+            v.insert(LspPullDiagnostics::Response {
+                server_id,
+                uri,
+                diagnostics: PulledDiagnostics::Changed {
+                    result_id,
+                    diagnostics: report.items,
+                },
+                registration_id,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp::{DiagnosticSeverity, DiagnosticTag};
+    use serde_json::json;
+
+    #[test]
+    fn test_serialize_lsp_diagnostic() {
+        let lsp_diagnostic = lsp::Diagnostic {
+            range: lsp::Range {
+                start: lsp::Position::new(0, 1),
+                end: lsp::Position::new(2, 3),
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(lsp::NumberOrString::String("E001".to_string())),
+            source: Some("test-source".to_string()),
+            message: "Test error message".to_string(),
+            related_information: None,
+            tags: Some(vec![DiagnosticTag::DEPRECATED]),
+            code_description: None,
+            data: Some(json!({"detail": "test detail"})),
+        };
+
+        let proto_diagnostic = GetDocumentDiagnostics::serialize_lsp_diagnostic(lsp_diagnostic)
+            .expect("Failed to serialize diagnostic");
+
+        let start = proto_diagnostic.start.unwrap();
+        let end = proto_diagnostic.end.unwrap();
+        assert_eq!(start.row, 0);
+        assert_eq!(start.column, 1);
+        assert_eq!(end.row, 2);
+        assert_eq!(end.column, 3);
+        assert_eq!(
+            proto_diagnostic.severity,
+            proto::lsp_diagnostic::Severity::Error as i32
+        );
+        assert_eq!(proto_diagnostic.code, Some("E001".to_string()));
+        assert_eq!(proto_diagnostic.source, Some("test-source".to_string()));
+        assert_eq!(proto_diagnostic.message, "Test error message");
+    }
+
+    #[test]
+    fn test_deserialize_lsp_diagnostic() {
+        let proto_diagnostic = proto::LspDiagnostic {
+            start: Some(proto::PointUtf16 { row: 0, column: 1 }),
+            end: Some(proto::PointUtf16 { row: 2, column: 3 }),
+            severity: proto::lsp_diagnostic::Severity::Warning as i32,
+            code: Some("ERR".to_string()),
+            source: Some("Prism".to_string()),
+            message: "assigned but unused variable - a".to_string(),
+            related_information: vec![],
+            tags: vec![],
+            code_description: None,
+            data: None,
+        };
+
+        let lsp_diagnostic = GetDocumentDiagnostics::deserialize_lsp_diagnostic(proto_diagnostic)
+            .expect("Failed to deserialize diagnostic");
+
+        assert_eq!(lsp_diagnostic.range.start.line, 0);
+        assert_eq!(lsp_diagnostic.range.start.character, 1);
+        assert_eq!(lsp_diagnostic.range.end.line, 2);
+        assert_eq!(lsp_diagnostic.range.end.character, 3);
+        assert_eq!(lsp_diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(
+            lsp_diagnostic.code,
+            Some(lsp::NumberOrString::String("ERR".to_string()))
+        );
+        assert_eq!(lsp_diagnostic.source, Some("Prism".to_string()));
+        assert_eq!(lsp_diagnostic.message, "assigned but unused variable - a");
+    }
+
+    #[test]
+    fn test_related_information() {
+        let related_info = lsp::DiagnosticRelatedInformation {
+            location: lsp::Location {
+                uri: lsp::Uri::from_str("file:///test.rs").unwrap(),
+                range: lsp::Range {
+                    start: lsp::Position::new(1, 1),
+                    end: lsp::Position::new(1, 5),
+                },
+            },
+            message: "Related info message".to_string(),
+        };
+
+        let lsp_diagnostic = lsp::Diagnostic {
+            range: lsp::Range {
+                start: lsp::Position::new(0, 0),
+                end: lsp::Position::new(0, 1),
+            },
+            severity: Some(DiagnosticSeverity::INFORMATION),
+            code: None,
+            source: Some("Prism".to_string()),
+            message: "assigned but unused variable - a".to_string(),
+            related_information: Some(vec![related_info]),
+            tags: None,
+            code_description: None,
+            data: None,
+        };
+
+        let proto_diagnostic = GetDocumentDiagnostics::serialize_lsp_diagnostic(lsp_diagnostic)
+            .expect("Failed to serialize diagnostic");
+
+        assert_eq!(proto_diagnostic.related_information.len(), 1);
+        let related = &proto_diagnostic.related_information[0];
+        assert_eq!(related.location_url, Some("file:///test.rs".to_string()));
+        assert_eq!(related.message, "Related info message");
+    }
+
+    #[test]
+    fn test_invalid_ranges() {
+        let proto_diagnostic = proto::LspDiagnostic {
+            start: None,
+            end: Some(proto::PointUtf16 { row: 2, column: 3 }),
+            severity: proto::lsp_diagnostic::Severity::Error as i32,
+            code: None,
+            source: None,
+            message: "Test message".to_string(),
+            related_information: vec![],
+            tags: vec![],
+            code_description: None,
+            data: None,
+        };
+
+        let result = GetDocumentDiagnostics::deserialize_lsp_diagnostic(proto_diagnostic);
+        assert!(result.is_err());
     }
 }

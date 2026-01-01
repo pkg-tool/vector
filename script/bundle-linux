@@ -10,17 +10,36 @@ Usage: ${0##*/} [options]
 Build a release .tar.gz for Linux.
 
 Options:
-  -h    Display this help and exit.
+  -h, --help     Display this help and exit.
+  --flatpak      Set ZED_BUNDLE_TYPE=flatpak so that this can be included in system info
   "
 }
 
-while getopts 'h' flag
-do
-    case "${flag}" in
-        h)
-           help_info
-           exit 0
-           ;;
+# Parse all arguments manually
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            help_info
+            exit 0
+            ;;
+        --flatpak)
+            export ZED_BUNDLE_TYPE=flatpak
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            help_info
+            exit 1
+            ;;
+        *)
+            echo "Error: Unexpected argument: $1" >&2
+            help_info
+            exit 1
+            ;;
     esac
 done
 
@@ -48,18 +67,45 @@ export CC=$(which clang)
 export RUSTFLAGS="${RUSTFLAGS:-} -C link-args=-Wl,--disable-new-dtags,-rpath,\$ORIGIN/../lib"
 cargo build --release --target "${target_triple}" --package vector --package cli
 
+# Upload debug info to sentry.io
+if ! command -v sentry-cli >/dev/null 2>&1; then
+    echo "sentry-cli not found. skipping sentry upload."
+    echo "install with: 'curl -sL https://sentry.io/get-cli | bash'"
+else
+    if [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
+        echo "Uploading zed debug symbols to sentry..."
+        # note: this uploads the unstripped binary which is needed because it contains
+        # .eh_frame data for stack unwinding. see https://github.com/getsentry/symbolic/issues/783
+        for attempt in 1 2 3; do
+            echo "Attempting sentry upload (attempt $attempt/3)..."
+            if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
+                "${target_dir}/${target_triple}"/release/zed \
+                "${target_dir}/${remote_server_triple}"/release/remote_server; then
+                echo "Sentry upload successful on attempt $attempt"
+                break
+            else
+                echo "Sentry upload failed on attempt $attempt"
+                if [ $attempt -eq 3 ]; then
+                    echo "All sentry upload attempts failed"
+                fi
+            fi
+        done
+    else
+        echo "missing SENTRY_AUTH_TOKEN. skipping sentry upload."
+    fi
+fi
+
 # Strip debug symbols and save them for upload to DigitalOcean
-objcopy --only-keep-debug "${target_dir}/${target_triple}/release/vector" "${target_dir}/${target_triple}/release/vector.dbg"
-objcopy --strip-debug "${target_dir}/${target_triple}/release/vector"
+objcopy --strip-debug "${target_dir}/${target_triple}/release/zed"
 objcopy --strip-debug "${target_dir}/${target_triple}/release/cli"
 
-gzip -f "${target_dir}/${target_triple}/release/vector.dbg"
-
-if [[ -n "${DIGITALOCEAN_SPACES_SECRET_KEY:-}" && -n "${DIGITALOCEAN_SPACES_ACCESS_KEY:-}" ]]; then
-    upload_to_blob_store_public \
-        "vector-debug-symbols" \
-        "${target_dir}/${target_triple}/release/vector.dbg.gz" \
-        "$channel/vector-$version-${target_triple}.dbg.gz"
+# Ensure that remote_server does not depend on libssl nor libcrypto, as we got rid of these deps.
+if ldd "${target_dir}/${remote_server_triple}/release/remote_server" | grep -q 'libcrypto\|libssl'; then
+    if [[ "$remote_server_triple" == *-musl ]]; then
+        echo "Error: remote_server still depends on libssl or libcrypto" && exit 1
+    else
+        echo "Info: Using non-musl remote-server build."
+    fi
 fi
 
 suffix=""
@@ -109,20 +155,16 @@ else
   export APP_NAME="Vector"
 fi
 
-mkdir -p "${vector_dir}/share/applications"
-envsubst < "crates/vector/resources/vector.desktop.in" > "${vector_dir}/share/applications/vector$suffix.desktop"
+mkdir -p "${zed_dir}/share/applications"
+envsubst < "crates/zed/resources/zed.desktop.in" > "${zed_dir}/share/applications/zed$suffix.desktop"
+chmod +x "${zed_dir}/share/applications/zed$suffix.desktop"
 
 # Copy generated licenses so they'll end up in archive too
 cp "assets/licenses.md" "${vector_dir}/licenses.md"
 
 # Create archive out of everything that's in the temp directory
 arch=$(uname -m)
-target="linux-${arch}"
-if  [[ "$channel" == "dev" ]]; then
-  archive="vector-${commit}-${target}.tar.gz"
-else
-  archive="vector-${target}.tar.gz"
-fi
+archive="zed-linux-${arch}.tar.gz"
 
 rm -rf "${archive}"
 remove_match="vector(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"

@@ -1,13 +1,14 @@
 use crate::wasm_host::WasmState;
 use anyhow::Result;
 use extension::{KeyValueStoreDelegate, ProjectDelegate, WorktreeDelegate};
-use semantic_version::SemanticVersion;
+use gpui::BackgroundExecutor;
+use semver::Version;
 use std::sync::{Arc, OnceLock};
 use wasmtime::component::{Linker, Resource};
 
 use super::latest;
 
-pub const MIN_VERSION: SemanticVersion = SemanticVersion::new(0, 2, 0);
+pub const MIN_VERSION: Version = Version::new(0, 2, 0);
 
 wasmtime::component::bindgen!({
     async: true,
@@ -29,6 +30,7 @@ wasmtime::component::bindgen!({
 pub use self::vector::extension::*;
 
 mod settings {
+    #![allow(dead_code)]
     include!(concat!(env!("OUT_DIR"), "/since_v0.2.0/settings.rs"));
 }
 
@@ -36,9 +38,9 @@ pub type ExtensionWorktree = Arc<dyn WorktreeDelegate>;
 pub type ExtensionProject = Arc<dyn ProjectDelegate>;
 pub type ExtensionKeyValueStore = Arc<dyn KeyValueStoreDelegate>;
 
-pub fn linker() -> &'static Linker<WasmState> {
+pub fn linker(executor: &BackgroundExecutor) -> &'static Linker<WasmState> {
     static LINKER: OnceLock<Linker<WasmState>> = OnceLock::new();
-    LINKER.get_or_init(|| super::new_linker(Extension::add_to_linker))
+    LINKER.get_or_init(|| super::new_linker(executor, Extension::add_to_linker))
 }
 
 impl From<Command> for latest::Command {

@@ -1,26 +1,26 @@
-use std::any::Any;
 use std::ops::Range;
-use std::path::PathBuf;
-use std::pin::Pin;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use extension::{Extension, ExtensionLanguageServerProxy, WorktreeDelegate};
-use fs::Fs;
-use futures::{Future, FutureExt};
-use gpui::AsyncApp;
+use futures::{FutureExt, future::join_all, lock::OwnedMutexGuard};
+use gpui::{App, AppContext, AsyncApp, Task};
 use language::{
-    BinaryStatus, CodeLabel, HighlightId, Language, LanguageName, LanguageToolchainStore,
-    LspAdapter, LspAdapterDelegate,
+    BinaryStatus, CodeLabel, DynLspInstaller, HighlightId, Language, LanguageName,
+    LanguageServerBinaryLocations, LspAdapter, LspAdapterDelegate, Toolchain,
 };
-use lsp::{CodeActionKind, LanguageServerBinary, LanguageServerBinaryOptions, LanguageServerName};
+use lsp::{
+    CodeActionKind, LanguageServerBinary, LanguageServerBinaryOptions, LanguageServerName,
+    LanguageServerSelector, Uri,
+};
 use serde::Serialize;
 use serde_json::Value;
-use util::{ResultExt, maybe};
+use util::{ResultExt, fs::make_file_executable, maybe, rel_path::RelPath};
 
-use crate::LanguageServerRegistryProxy;
+use crate::{LanguageServerRegistryProxy, LspAccess};
 
 /// An adapter that allows an [`LspAdapterDelegate`] to be used as a [`WorktreeDelegate`].
 struct WorktreeDelegateAdapter(pub Arc<dyn LspAdapterDelegate>);
@@ -32,10 +32,10 @@ impl WorktreeDelegate for WorktreeDelegateAdapter {
     }
 
     fn root_path(&self) -> String {
-        self.0.worktree_root_path().to_string_lossy().to_string()
+        self.0.worktree_root_path().to_string_lossy().into_owned()
     }
 
-    async fn read_text_file(&self, path: PathBuf) -> Result<String> {
+    async fn read_text_file(&self, path: &RelPath) -> Result<String> {
         self.0.read_text_file(path).await
     }
 
@@ -43,7 +43,7 @@ impl WorktreeDelegate for WorktreeDelegateAdapter {
         self.0
             .which(binary_name.as_ref())
             .await
-            .map(|path| path.to_string_lossy().to_string())
+            .map(|path| path.to_string_lossy().into_owned())
     }
 
     async fn shell_env(&self) -> Vec<(String, String)> {
@@ -71,10 +71,50 @@ impl ExtensionLanguageServerProxy for LanguageServerRegistryProxy {
     fn remove_language_server(
         &self,
         language: &LanguageName,
-        language_server_id: &LanguageServerName,
-    ) {
+        language_server_name: &LanguageServerName,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
         self.language_registry
-            .remove_lsp_adapter(language, language_server_id);
+            .remove_lsp_adapter(language, language_server_name);
+
+        let mut tasks = Vec::new();
+        match &self.lsp_access {
+            LspAccess::ViaLspStore(lsp_store) => lsp_store.update(cx, |lsp_store, cx| {
+                let stop_task = lsp_store.stop_language_servers_for_buffers(
+                    Vec::new(),
+                    HashSet::from_iter([LanguageServerSelector::Name(
+                        language_server_name.clone(),
+                    )]),
+                    cx,
+                );
+                tasks.push(stop_task);
+            }),
+            LspAccess::ViaWorkspaces(lsp_store_provider) => {
+                if let Ok(lsp_stores) = lsp_store_provider(cx) {
+                    for lsp_store in lsp_stores {
+                        lsp_store.update(cx, |lsp_store, cx| {
+                            let stop_task = lsp_store.stop_language_servers_for_buffers(
+                                Vec::new(),
+                                HashSet::from_iter([LanguageServerSelector::Name(
+                                    language_server_name.clone(),
+                                )]),
+                                cx,
+                            );
+                            tasks.push(stop_task);
+                        });
+                    }
+                }
+            }
+            LspAccess::Noop => {}
+        }
+
+        cx.background_spawn(async move {
+            let results = join_all(tasks).await;
+            for result in results {
+                result?;
+            }
+            Ok(())
+        })
     }
 
     fn update_language_server_status(
@@ -82,8 +122,13 @@ impl ExtensionLanguageServerProxy for LanguageServerRegistryProxy {
         language_server_id: LanguageServerName,
         status: BinaryStatus,
     ) {
+        log::debug!(
+            "updating binary status for {} to {:?}",
+            language_server_id,
+            status
+        );
         self.language_registry
-            .update_lsp_status(language_server_id, status);
+            .update_lsp_binary_status(language_server_id, status);
     }
 }
 
@@ -108,83 +153,121 @@ impl ExtensionLspAdapter {
 }
 
 #[async_trait(?Send)]
-impl LspAdapter for ExtensionLspAdapter {
-    fn name(&self) -> LanguageServerName {
-        self.language_server_id.clone()
-    }
-
-    fn get_language_server_command<'a>(
+impl DynLspInstaller for ExtensionLspAdapter {
+    fn get_language_server_command(
         self: Arc<Self>,
         delegate: Arc<dyn LspAdapterDelegate>,
-        _: Arc<dyn LanguageToolchainStore>,
+        _: Option<Toolchain>,
         _: LanguageServerBinaryOptions,
-        _: futures::lock::MutexGuard<'a, Option<LanguageServerBinary>>,
-        _: &'a mut AsyncApp,
-    ) -> Pin<Box<dyn 'a + Future<Output = Result<LanguageServerBinary>>>> {
+        _: OwnedMutexGuard<Option<(bool, LanguageServerBinary)>>,
+        _: AsyncApp,
+    ) -> LanguageServerBinaryLocations {
         async move {
-            let delegate = Arc::new(WorktreeDelegateAdapter(delegate.clone())) as _;
-            let command = self
-                .extension
-                .language_server_command(
-                    self.language_server_id.clone(),
-                    self.language_name.clone(),
-                    delegate,
-                )
-                .await?;
+            let ret = maybe!(async move {
+                let delegate = Arc::new(WorktreeDelegateAdapter(delegate.clone())) as _;
+                let command = self
+                    .extension
+                    .language_server_command(
+                        self.language_server_id.clone(),
+                        self.language_name.clone(),
+                        delegate,
+                    )
+                    .await?;
 
-            let path = self.extension.path_from_extension(command.command.as_ref());
-
-            // TODO: This should now be done via the extension API's `make_file_executable`
-            // function, but we're leaving these existing usages in place temporarily
-            // to avoid any compatibility issues between the app and older extension versions.
-            //
-            // We can remove once the following extension versions no longer see any use:
-            // - toml@0.0.2
-            // - zig@0.0.1
-            if ["toml", "zig"].contains(&self.extension.manifest().id.as_ref())
-                && path.starts_with(&self.extension.work_dir())
-            {
-                #[cfg(not(windows))]
+                // on windows, extensions might produce weird paths
+                // that start with a leading slash due to WASI
+                // requiring that for PWD and friends so account for
+                // that here and try to transform those paths back
+                // to windows paths
+                //
+                // if we don't do this, std will interpret the path as relative,
+                // which changes join behavior
+                let command_path: &Path = if cfg!(windows)
+                    && let Some(command) = command.command.to_str()
                 {
-                    use std::fs::{self, Permissions};
-                    use std::os::unix::fs::PermissionsExt;
+                    let mut chars = command.chars();
+                    if chars.next().is_some_and(|c| c == '/')
+                        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+                        && chars.next().is_some_and(|c| c == ':')
+                        && chars.next().is_some_and(|c| c == '\\' || c == '/')
+                    {
+                        // looks like a windows path with a leading slash, so strip it
+                        command.strip_prefix('/').unwrap().as_ref()
+                    } else {
+                        command.as_ref()
+                    }
+                } else {
+                    command.command.as_ref()
+                };
+                let path = self.extension.path_from_extension(command_path);
 
-                    fs::set_permissions(&path, Permissions::from_mode(0o755))
+                // TODO: This should now be done via the `zed::make_file_executable` function in
+                // Zed extension API, but we're leaving these existing usages in place temporarily
+                // to avoid any compatibility issues between Zed and the extension versions.
+                //
+                // We can remove once the following extension versions no longer see any use:
+                // - toml@0.0.2
+                // - zig@0.0.1
+                if ["toml", "zig"].contains(&self.extension.manifest().id.as_ref())
+                    && path.starts_with(&self.extension.work_dir())
+                {
+                    make_file_executable(&path)
+                        .await
                         .context("failed to set file permissions")?;
                 }
-            }
 
-            Ok(LanguageServerBinary {
-                path,
-                arguments: command.args.into_iter().map(|arg| arg.into()).collect(),
-                env: Some(command.env.into_iter().collect()),
+                Ok(LanguageServerBinary {
+                    path,
+                    arguments: command
+                        .args
+                        .into_iter()
+                        .map(|arg| {
+                            // on windows, extensions might produce weird paths
+                            // that start with a leading slash due to WASI
+                            // requiring that for PWD and friends so account for
+                            // that here and try to transform those paths back
+                            // to windows paths
+                            if cfg!(windows) {
+                                let mut chars = arg.chars();
+                                if chars.next().is_some_and(|c| c == '/')
+                                    && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+                                    && chars.next().is_some_and(|c| c == ':')
+                                    && chars.next().is_some_and(|c| c == '\\' || c == '/')
+                                {
+                                    // looks like a windows path with a leading slash, so strip it
+                                    arg.strip_prefix('/').unwrap().into()
+                                } else {
+                                    arg.into()
+                                }
+                            } else {
+                                arg.into()
+                            }
+                        })
+                        .collect(),
+                    env: Some(command.env.into_iter().collect()),
+                })
             })
+            .await;
+            (ret, None)
         }
         .boxed_local()
     }
 
-    async fn fetch_latest_server_version(
+    async fn try_fetch_server_binary(
         &self,
-        _: &dyn LspAdapterDelegate,
-    ) -> Result<Box<dyn 'static + Send + Any>> {
-        unreachable!("get_language_server_command is overridden")
-    }
-
-    async fn fetch_server_binary(
-        &self,
-        _: Box<dyn 'static + Send + Any>,
+        _: &Arc<dyn LspAdapterDelegate>,
         _: PathBuf,
-        _: &dyn LspAdapterDelegate,
+        _: bool,
+        _: &mut AsyncApp,
     ) -> Result<LanguageServerBinary> {
         unreachable!("get_language_server_command is overridden")
     }
+}
 
-    async fn cached_server_binary(
-        &self,
-        _: PathBuf,
-        _: &dyn LspAdapterDelegate,
-    ) -> Option<LanguageServerBinary> {
-        unreachable!("get_language_server_command is overridden")
+#[async_trait(?Send)]
+impl LspAdapter for ExtensionLspAdapter {
+    fn name(&self) -> LanguageServerName {
+        self.language_server_id.clone()
     }
 
     fn code_action_kinds(&self) -> Option<Vec<CodeActionKind>> {
@@ -204,7 +287,7 @@ impl LspAdapter for ExtensionLspAdapter {
         ]))
     }
 
-    fn language_ids(&self) -> HashMap<String, String> {
+    fn language_ids(&self) -> HashMap<LanguageName, String> {
         // TODO: The language IDs can be provided via the language server options
         // in `extension.toml now but we're leaving these existing usages in place temporarily
         // to avoid any compatibility issues between the app and older extension versions.
@@ -212,7 +295,7 @@ impl LspAdapter for ExtensionLspAdapter {
         // We can remove once the following extension versions no longer see any use:
         // - php@0.0.1
         if self.extension.manifest().id.as_ref() == "php" {
-            return HashMap::from_iter([("PHP".into(), "php".into())]);
+            return HashMap::from_iter([(LanguageName::new_static("PHP"), "php".into())]);
         }
 
         self.extension
@@ -225,7 +308,6 @@ impl LspAdapter for ExtensionLspAdapter {
 
     async fn initialization_options(
         self: Arc<Self>,
-        _: &dyn Fs,
         delegate: &Arc<dyn LspAdapterDelegate>,
     ) -> Result<Option<serde_json::Value>> {
         let delegate = Arc::new(WorktreeDelegateAdapter(delegate.clone())) as _;
@@ -248,9 +330,9 @@ impl LspAdapter for ExtensionLspAdapter {
 
     async fn workspace_configuration(
         self: Arc<Self>,
-        _: &dyn Fs,
         delegate: &Arc<dyn LspAdapterDelegate>,
-        _: Arc<dyn LanguageToolchainStore>,
+        _: Option<Toolchain>,
+        _: Option<Uri>,
         _cx: &mut AsyncApp,
     ) -> Result<Value> {
         let delegate = Arc::new(WorktreeDelegateAdapter(delegate.clone())) as _;
@@ -270,7 +352,6 @@ impl LspAdapter for ExtensionLspAdapter {
     async fn additional_initialization_options(
         self: Arc<Self>,
         target_language_server_id: LanguageServerName,
-        _: &dyn Fs,
         delegate: &Arc<dyn LspAdapterDelegate>,
     ) -> Result<Option<serde_json::Value>> {
         let delegate = Arc::new(WorktreeDelegateAdapter(delegate.clone())) as _;
@@ -296,9 +377,9 @@ impl LspAdapter for ExtensionLspAdapter {
     async fn additional_workspace_configuration(
         self: Arc<Self>,
         target_language_server_id: LanguageServerName,
-        _: &dyn Fs,
+
         delegate: &Arc<dyn LspAdapterDelegate>,
-        _: Arc<dyn LanguageToolchainStore>,
+
         _cx: &mut AsyncApp,
     ) -> Result<Option<serde_json::Value>> {
         let delegate = Arc::new(WorktreeDelegateAdapter(delegate.clone())) as _;
@@ -358,6 +439,10 @@ impl LspAdapter for ExtensionLspAdapter {
             .await?;
 
         Ok(labels_from_extension(labels, language))
+    }
+
+    fn is_extension(&self) -> bool {
+        true
     }
 }
 
@@ -432,11 +517,7 @@ fn build_code_label(
 
     let filter_range = label.filter_range.clone();
     text.get(filter_range.clone())?;
-    Some(CodeLabel {
-        text,
-        runs,
-        filter_range,
-    })
+    Some(CodeLabel::new(text, filter_range, runs))
 }
 
 fn lsp_completion_to_extension(value: lsp::CompletionItem) -> extension::Completion {
@@ -584,11 +665,7 @@ fn test_build_code_label() {
 
     assert_eq!(
         label,
-        CodeLabel {
-            text: label_text,
-            runs: label_runs,
-            filter_range: label.filter_range.clone()
-        }
+        CodeLabel::new(label_text, label.filter_range.clone(), label_runs)
     )
 }
 

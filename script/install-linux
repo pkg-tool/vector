@@ -15,12 +15,8 @@ export VECTOR_CHANNEL=$(<crates/release_channel/RELEASE_CHANNEL)
 export VECTOR_UPDATE_EXPLANATION="You need to fetch and rebuild vector in $(pwd)"
 script/bundle-linux
 
-target="linux-$(uname -m)"
+arch="$(uname -m)"
 commit=$(git rev-parse HEAD | cut -c 1-7)
-if  [[ "$VECTOR_CHANNEL" == "dev" ]]; then
-  archive="vector-${commit}-${target}.tar.gz"
-else
-  archive="vector-${target}.tar.gz"
-fi
-export VECTOR_BUNDLE_PATH="${CARGO_TARGET_DIR:-target}/release/${archive}"
+archive="zed-linux-${arch}.tar.gz"
+export ZED_BUNDLE_PATH="${CARGO_TARGET_DIR:-target}/release/${archive}"
 script/install.sh

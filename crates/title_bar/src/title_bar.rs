@@ -1,5 +1,7 @@
 mod application_menu;
+pub mod platform_title_bar;
 mod platforms;
+mod system_window_tabs;
 mod title_bar_settings;
 mod window_controls;
 
@@ -167,14 +169,14 @@ impl Render for TitleBar {
                     // Note: On Windows the title bar behavior is handled by the platform implementation.
                     .when(self.platform_style == PlatformStyle::Mac, |this| {
                         this.on_click(|event, window, _| {
-                            if event.up.click_count == 2 {
+                            if event.click_count() == 2 {
                                 window.titlebar_double_click();
                             }
                         })
                     })
                     .when(self.platform_style == PlatformStyle::Linux, |this| {
                         this.on_click(|event, window, _| {
-                            if event.up.click_count == 2 {
+                            if event.click_count() == 2 {
                                 window.zoom_window();
                             }
                         })
@@ -187,7 +189,8 @@ impl Render for TitleBar {
                                     || title_bar_settings.show_project_items;
                                 title_bar
                                     .when_some(self.application_menu.clone(), |title_bar, menu| {
-                                        render_project_items &= !menu.read(cx).all_menus_shown();
+                                        render_project_items &=
+                                            !menu.read(cx).all_menus_shown_in_title_bar(cx);
                                         title_bar.child(menu)
                                     })
                                     .when(render_project_items, |title_bar| {
@@ -333,16 +336,15 @@ impl TitleBar {
 
     pub fn render_project_name(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let name = {
-            let mut names = self.project.read(cx).visible_worktrees(cx).map(|worktree| {
-                let worktree = worktree.read(cx);
-                worktree.root_name()
-            });
-
-            names.next()
+            self.project
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|worktree| worktree.read(cx).root_name_str().to_string())
         };
         let is_project_selected = name.is_some();
         let name = if let Some(name) = name {
-            util::truncate_and_trailoff(name, MAX_PROJECT_NAME_LENGTH)
+            util::truncate_and_trailoff(&name, MAX_PROJECT_NAME_LENGTH)
         } else {
             "Open recent project".to_string()
         };
@@ -351,13 +353,12 @@ impl TitleBar {
             .when(!is_project_selected, |b| b.color(Color::Muted))
             .style(ButtonStyle::Subtle)
             .label_size(LabelSize::Small)
-            .tooltip(move |window, cx| {
+            .tooltip(move |_window, cx| {
                 Tooltip::for_action(
                     "Recent Projects",
                     &vector_actions::OpenRecent {
                         create_new_window: false,
                     },
-                    window,
                     cx,
                 )
             })
@@ -397,12 +398,11 @@ impl TitleBar {
                 .color(Color::Muted)
                 .style(ButtonStyle::Subtle)
                 .label_size(LabelSize::Small)
-                .tooltip(move |window, cx| {
+                .tooltip(move |_window, cx| {
                     Tooltip::with_meta(
                         "Recent Branches",
                         Some(&vector_actions::git::Branch),
                         "Local branches only",
-                        window,
                         cx,
                     )
                 })

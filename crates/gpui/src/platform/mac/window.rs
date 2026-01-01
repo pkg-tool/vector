@@ -1,19 +1,22 @@
 use super::{BoolExt, MacDisplay, NSRange, NSStringExt, ns_string, renderer};
 use crate::{
-    AnyWindowHandle, Bounds, DisplayLink, ExternalPaths, FileDropEvent, ForegroundExecutor,
-    KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ScaledPixels, Size,
-    Timer, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowParams,
-    platform::PlatformInputHandler, point, px, size,
+    AnyWindowHandle, Bounds, Capslock, DisplayLink, ExternalPaths, FileDropEvent,
+    ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    SharedString, Size, SystemWindowTab, Timer, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowKind, WindowParams, dispatch_get_main_queue,
+    dispatch_sys::dispatch_async_f, platform::PlatformInputHandler, point, px, size,
 };
 use block::ConcreteBlock;
 use cocoa::{
     appkit::{
-        NSApplication, NSBackingStoreBuffered, NSColor, NSEvent, NSEventModifierFlags,
-        NSFilenamesPboardType, NSPasteboard, NSScreen, NSView, NSViewHeightSizable,
-        NSViewWidthSizable, NSWindow, NSWindowButton, NSWindowCollectionBehavior,
-        NSWindowOcclusionState, NSWindowStyleMask, NSWindowTitleVisibility,
+        NSAppKitVersionNumber, NSAppKitVersionNumber12_0, NSApplication, NSBackingStoreBuffered,
+        NSColor, NSEvent, NSEventModifierFlags, NSFilenamesPboardType, NSPasteboard, NSScreen,
+        NSView, NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial,
+        NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowButton,
+        NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
+        NSWindowStyleMask, NSWindowTitleVisibility,
     },
     base::{id, nil},
     foundation::{
@@ -22,6 +25,7 @@ use cocoa::{
         NSUserDefaults,
     },
 };
+
 use core_graphics::display::{CGDirectDisplayID, CGPoint, CGRect};
 use ctor::ctor;
 use futures::channel::oneshot;
@@ -53,12 +57,16 @@ const WINDOW_STATE_IVAR: &str = "windowState";
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
+static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
 
 #[allow(non_upper_case_globals)]
 const NSWindowStyleMaskNonactivatingPanel: NSWindowStyleMask =
-    unsafe { NSWindowStyleMask::from_bits_unchecked(1 << 7) };
+    NSWindowStyleMask::from_bits_retain(1 << 7);
+// WindowLevel const value ref: https://docs.rs/core-graphics2/0.4.1/src/core_graphics2/window_level.rs.html
 #[allow(non_upper_case_globals)]
 const NSNormalWindowLevel: NSInteger = 0;
+#[allow(non_upper_case_globals)]
+const NSFloatingWindowLevel: NSInteger = 3;
 #[allow(non_upper_case_globals)]
 const NSPopUpWindowLevel: NSInteger = 101;
 #[allow(non_upper_case_globals)]
@@ -79,6 +87,12 @@ type NSDragOperation = NSUInteger;
 const NSDragOperationNone: NSDragOperation = 0;
 #[allow(non_upper_case_globals)]
 const NSDragOperationCopy: NSDragOperation = 1;
+#[derive(PartialEq)]
+pub enum UserTabbingPreference {
+    Never,
+    Always,
+    InFullScreen,
+}
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -140,6 +154,10 @@ unsafe fn build_classes() {
                 );
                 decl.add_method(
                     sel!(mouseMoved:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(pressureChangeWithEvent:),
                     handle_view_event as extern "C" fn(&Object, Sel, id),
                 );
                 decl.add_method(
@@ -241,6 +259,20 @@ unsafe fn build_classes() {
             }
             decl.register()
         };
+        BLURRED_VIEW_CLASS = {
+            let mut decl = ClassDecl::new("BlurredView", class!(NSVisualEffectView)).unwrap();
+            unsafe {
+                decl.add_method(
+                    sel!(initWithFrame:),
+                    blurred_view_init_with_frame as extern "C" fn(&Object, Sel, NSRect) -> id,
+                );
+                decl.add_method(
+                    sel!(updateLayer),
+                    blurred_view_update_layer as extern "C" fn(&Object, Sel),
+                );
+                decl.register()
+            }
+        };
     }
 }
 
@@ -326,6 +358,36 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
             conclude_drag_operation as extern "C" fn(&Object, Sel, id),
         );
 
+        decl.add_method(
+            sel!(addTitlebarAccessoryViewController:),
+            add_titlebar_accessory_view_controller as extern "C" fn(&Object, Sel, id),
+        );
+
+        decl.add_method(
+            sel!(moveTabToNewWindow:),
+            move_tab_to_new_window as extern "C" fn(&Object, Sel, id),
+        );
+
+        decl.add_method(
+            sel!(mergeAllWindows:),
+            merge_all_windows as extern "C" fn(&Object, Sel, id),
+        );
+
+        decl.add_method(
+            sel!(selectNextTab:),
+            select_next_tab as extern "C" fn(&Object, Sel, id),
+        );
+
+        decl.add_method(
+            sel!(selectPreviousTab:),
+            select_previous_tab as extern "C" fn(&Object, Sel, id),
+        );
+
+        decl.add_method(
+            sel!(toggleTabBar:),
+            toggle_tab_bar as extern "C" fn(&Object, Sel, id),
+        );
+
         decl.register()
     }
 }
@@ -335,6 +397,7 @@ struct MacWindowState {
     executor: ForegroundExecutor,
     native_window: id,
     native_view: NonNull<Object>,
+    blurred_view: Option<id>,
     display_link: Option<DisplayLink>,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -357,6 +420,14 @@ struct MacWindowState {
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
     fullscreen_restore_bounds: Bounds<Pixels>,
+    move_tab_to_new_window_callback: Option<Box<dyn FnMut()>>,
+    merge_all_windows_callback: Option<Box<dyn FnMut()>>,
+    select_next_tab_callback: Option<Box<dyn FnMut()>>,
+    select_previous_tab_callback: Option<Box<dyn FnMut()>>,
+    toggle_tab_bar_callback: Option<Box<dyn FnMut()>>,
+    activated_least_once: bool,
+    // The parent window if this window is a sheet (Dialog kind)
+    sheet_parent: Option<id>,
 }
 
 impl MacWindowState {
@@ -452,10 +523,11 @@ impl MacWindowState {
 
     fn bounds(&self) -> Bounds<Pixels> {
         let mut window_frame = unsafe { NSWindow::frame(self.native_window) };
-        let screen_frame = unsafe {
-            let screen = NSWindow::screen(self.native_window);
-            NSScreen::frame(screen)
-        };
+        let screen = unsafe { NSWindow::screen(self.native_window) };
+        if screen == nil {
+            return Bounds::new(point(px(0.), px(0.)), crate::DEFAULT_WINDOW_SIZE);
+        }
+        let screen_frame = unsafe { NSScreen::frame(screen) };
 
         // Flip the y coordinate to be top-left origin
         window_frame.origin.y =
@@ -512,10 +584,13 @@ impl MacWindow {
             titlebar,
             kind,
             is_movable,
+            is_resizable,
+            is_minimizable,
             focus,
             show,
             display_id,
             window_min_size,
+            tabbing_identifier,
         }: WindowParams,
         executor: ForegroundExecutor,
         renderer_context: renderer::Context,
@@ -523,14 +598,25 @@ impl MacWindow {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
 
-            let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
+            let allows_automatic_window_tabbing = tabbing_identifier.is_some();
+            if allows_automatic_window_tabbing {
+                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: YES];
+            } else {
+                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
+            }
 
             let mut style_mask;
             if let Some(titlebar) = titlebar.as_ref() {
-                style_mask = NSWindowStyleMask::NSClosableWindowMask
-                    | NSWindowStyleMask::NSMiniaturizableWindowMask
-                    | NSWindowStyleMask::NSResizableWindowMask
-                    | NSWindowStyleMask::NSTitledWindowMask;
+                style_mask =
+                    NSWindowStyleMask::NSClosableWindowMask | NSWindowStyleMask::NSTitledWindowMask;
+
+                if is_resizable {
+                    style_mask |= NSWindowStyleMask::NSResizableWindowMask;
+                }
+
+                if is_minimizable {
+                    style_mask |= NSWindowStyleMask::NSMiniaturizableWindowMask;
+                }
 
                 if titlebar.appears_transparent {
                     style_mask |= NSWindowStyleMask::NSFullSizeContentViewWindowMask;
@@ -541,9 +627,14 @@ impl MacWindow {
             }
 
             let native_window: id = match kind {
-                WindowKind::Normal => msg_send![WINDOW_CLASS, alloc],
+                WindowKind::Normal => {
+                    msg_send![WINDOW_CLASS, alloc]
+                }
                 WindowKind::PopUp => {
                     style_mask |= NSWindowStyleMaskNonactivatingPanel;
+                    msg_send![PANEL_CLASS, alloc]
+                }
+                WindowKind::Floating | WindowKind::Dialog => {
                     msg_send![PANEL_CLASS, alloc]
                 }
             };
@@ -600,8 +691,9 @@ impl MacWindow {
                 setReleasedWhenClosed: NO
             ];
 
+            let content_view = native_window.contentView();
             let native_view: id = msg_send![VIEW_CLASS, alloc];
-            let native_view = NSView::init(native_view);
+            let native_view = NSView::initWithFrame_(native_view, NSView::bounds(content_view));
             assert!(!native_view.is_null());
 
             let mut window = Self(Arc::new(Mutex::new(MacWindowState {
@@ -609,6 +701,7 @@ impl MacWindow {
                 executor,
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
+                blurred_view: None,
                 display_link: None,
                 renderer: renderer::new_renderer(
                     renderer_context,
@@ -633,13 +726,20 @@ impl MacWindow {
                     .and_then(|titlebar| titlebar.traffic_light_position),
                 transparent_titlebar: titlebar
                     .as_ref()
-                    .map_or(true, |titlebar| titlebar.appears_transparent),
+                    .is_none_or(|titlebar| titlebar.appears_transparent),
                 previous_modifiers_changed_event: None,
                 keystroke_for_do_command: None,
                 do_command_handled: None,
                 external_files_dragged: false,
                 first_mouse: false,
                 fullscreen_restore_bounds: Bounds::default(),
+                move_tab_to_new_window_callback: None,
+                merge_all_windows_callback: None,
+                select_next_tab_callback: None,
+                select_previous_tab_callback: None,
+                toggle_tab_bar_callback: None,
+                activated_least_once: false,
+                sheet_parent: None,
             })));
 
             (*native_window).set_ivar(
@@ -668,7 +768,7 @@ impl MacWindow {
                 });
             }
 
-            if titlebar.map_or(true, |titlebar| titlebar.appears_transparent) {
+            if titlebar.is_none_or(|titlebar| titlebar.appears_transparent) {
                 native_window.setTitlebarAppearsTransparent_(YES);
                 native_window.setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleHidden);
             }
@@ -683,17 +783,33 @@ impl MacWindow {
             // itself and break the association with its context.
             native_view.setWantsLayer(YES);
             let _: () = msg_send![
-                native_view,
-                setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize
+            native_view,
+            setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize
             ];
 
-            native_window.setContentView_(native_view.autorelease());
+            content_view.addSubview_(native_view.autorelease());
             native_window.makeFirstResponder_(native_view);
 
+            let app: id = NSApplication::sharedApplication(nil);
+            let main_window: id = msg_send![app, mainWindow];
+            let mut sheet_parent = None;
+
             match kind {
-                WindowKind::Normal => {
-                    native_window.setLevel_(NSNormalWindowLevel);
+                WindowKind::Normal | WindowKind::Floating => {
+                    if kind == WindowKind::Floating {
+                        // Let the window float keep above normal windows.
+                        native_window.setLevel_(NSFloatingWindowLevel);
+                    } else {
+                        native_window.setLevel_(NSNormalWindowLevel);
+                    }
                     native_window.setAcceptsMouseMovedEvents_(YES);
+
+                    if let Some(tabbing_identifier) = tabbing_identifier {
+                        let tabbing_id = ns_string(tabbing_identifier.as_str());
+                        let _: () = msg_send![native_window, setTabbingIdentifier: tabbing_id];
+                    } else {
+                        let _: () = msg_send![native_window, setTabbingIdentifier:nil];
+                    }
                 }
                 WindowKind::PopUp => {
                     // Use a tracking area to allow receiving MouseMoved events even when
@@ -720,6 +836,51 @@ impl MacWindow {
                         NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
                     );
                 }
+                WindowKind::Dialog => {
+                    if !main_window.is_null() {
+                        let parent = {
+                            let active_sheet: id = msg_send![main_window, attachedSheet];
+                            if active_sheet.is_null() {
+                                main_window
+                            } else {
+                                active_sheet
+                            }
+                        };
+                        let _: () =
+                            msg_send![parent, beginSheet: native_window completionHandler: nil];
+                        sheet_parent = Some(parent);
+                    }
+                }
+            }
+
+            if allows_automatic_window_tabbing
+                && !main_window.is_null()
+                && main_window != native_window
+            {
+                let main_window_is_fullscreen = main_window
+                    .styleMask()
+                    .contains(NSWindowStyleMask::NSFullScreenWindowMask);
+                let user_tabbing_preference = Self::get_user_tabbing_preference()
+                    .unwrap_or(UserTabbingPreference::InFullScreen);
+                let should_add_as_tab = user_tabbing_preference == UserTabbingPreference::Always
+                    || user_tabbing_preference == UserTabbingPreference::InFullScreen
+                        && main_window_is_fullscreen;
+
+                if should_add_as_tab {
+                    let main_window_can_tab: BOOL =
+                        msg_send![main_window, respondsToSelector: sel!(addTabbedWindow:ordered:)];
+                    let main_window_visible: BOOL = msg_send![main_window, isVisible];
+
+                    if main_window_can_tab == YES && main_window_visible == YES {
+                        let _: () = msg_send![main_window, addTabbedWindow: native_window ordered: NSWindowOrderingMode::NSWindowAbove];
+
+                        // Ensure the window is visible immediately after adding the tab, since the tab bar is updated with a new entry at this point.
+                        // Note: Calling orderFront here can break fullscreen mode (makes fullscreen windows exit fullscreen), so only do this if the main window is not fullscreen.
+                        if !main_window_is_fullscreen {
+                            let _: () = msg_send![native_window, orderFront: nil];
+                        }
+                    }
+                }
             }
 
             if focus && show {
@@ -733,7 +894,11 @@ impl MacWindow {
             // the window position might be incorrect if the main screen (the screen that contains the window that has focus)
             //  is different from the primary screen.
             NSWindow::setFrameTopLeftPoint_(native_window, window_rect.origin);
-            window.0.lock().move_traffic_light();
+            {
+                let mut window_state = window.0.lock();
+                window_state.move_traffic_light();
+                window_state.sheet_parent = sheet_parent;
+            }
 
             pool.drain();
 
@@ -776,6 +941,33 @@ impl MacWindow {
             window_handles
         }
     }
+
+    pub fn get_user_tabbing_preference() -> Option<UserTabbingPreference> {
+        unsafe {
+            let defaults: id = NSUserDefaults::standardUserDefaults();
+            let domain = ns_string("NSGlobalDomain");
+            let key = ns_string("AppleWindowTabbingMode");
+
+            let dict: id = msg_send![defaults, persistentDomainForName: domain];
+            let value: id = if !dict.is_null() {
+                msg_send![dict, objectForKey: key]
+            } else {
+                nil
+            };
+
+            let value_str = if !value.is_null() {
+                CStr::from_ptr(NSString::UTF8String(value)).to_string_lossy()
+            } else {
+                "".into()
+            };
+
+            match value_str.as_ref() {
+                "manual" => Some(UserTabbingPreference::Never),
+                "always" => Some(UserTabbingPreference::Always),
+                _ => Some(UserTabbingPreference::InFullScreen),
+            }
+        }
+    }
 }
 
 impl Drop for MacWindow {
@@ -783,6 +975,7 @@ impl Drop for MacWindow {
         let mut this = self.0.lock();
         this.renderer.destroy();
         let window = this.native_window;
+        let sheet_parent = this.sheet_parent.take();
         this.display_link.take();
         unsafe {
             this.native_window.setDelegate_(nil);
@@ -791,6 +984,9 @@ impl Drop for MacWindow {
         this.executor
             .spawn(async move {
                 unsafe {
+                    if let Some(parent) = sheet_parent {
+                        let _: () = msg_send![parent, endSheet: window];
+                    }
                     window.close();
                     window.autorelease();
                 }
@@ -831,6 +1027,65 @@ impl PlatformWindow for MacWindow {
             .detach();
     }
 
+    fn merge_all_windows(&self) {
+        let native_window = self.0.lock().native_window;
+        unsafe extern "C" fn merge_windows_async(context: *mut std::ffi::c_void) {
+            let native_window = context as id;
+            let _: () = msg_send![native_window, mergeAllWindows:nil];
+        }
+
+        unsafe {
+            dispatch_async_f(
+                dispatch_get_main_queue(),
+                native_window as *mut std::ffi::c_void,
+                Some(merge_windows_async),
+            );
+        }
+    }
+
+    fn move_tab_to_new_window(&self) {
+        let native_window = self.0.lock().native_window;
+        unsafe extern "C" fn move_tab_async(context: *mut std::ffi::c_void) {
+            let native_window = context as id;
+            let _: () = msg_send![native_window, moveTabToNewWindow:nil];
+            let _: () = msg_send![native_window, makeKeyAndOrderFront: nil];
+        }
+
+        unsafe {
+            dispatch_async_f(
+                dispatch_get_main_queue(),
+                native_window as *mut std::ffi::c_void,
+                Some(move_tab_async),
+            );
+        }
+    }
+
+    fn toggle_window_tab_overview(&self) {
+        let native_window = self.0.lock().native_window;
+        unsafe {
+            let _: () = msg_send![native_window, toggleTabOverview:nil];
+        }
+    }
+
+    fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {
+        let native_window = self.0.lock().native_window;
+        unsafe {
+            let allows_automatic_window_tabbing = tabbing_identifier.is_some();
+            if allows_automatic_window_tabbing {
+                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: YES];
+            } else {
+                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
+            }
+
+            if let Some(tabbing_identifier) = tabbing_identifier {
+                let tabbing_id = ns_string(tabbing_identifier.as_str());
+                let _: () = msg_send![native_window, setTabbingIdentifier: tabbing_id];
+            } else {
+                let _: () = msg_send![native_window, setTabbingIdentifier:nil];
+            }
+        }
+    }
+
     fn scale_factor(&self) -> f32 {
         self.0.as_ref().lock().scale_factor()
     }
@@ -849,10 +1104,8 @@ impl PlatformWindow for MacWindow {
                 return None;
             }
             let device_description: id = msg_send![screen, deviceDescription];
-            let screen_number: id = NSDictionary::valueForKey_(
-                device_description,
-                NSString::alloc(nil).init_str("NSScreenNumber"),
-            );
+            let screen_number: id =
+                NSDictionary::valueForKey_(device_description, ns_string("NSScreenNumber"));
 
             let screen_number: u32 = msg_send![screen_number, unsignedIntValue];
 
@@ -886,6 +1139,16 @@ impl PlatformWindow for MacWindow {
                 shift,
                 platform: command,
                 function,
+            }
+        }
+    }
+
+    fn capslock(&self) -> Capslock {
+        unsafe {
+            let modifiers: NSEventModifierFlags = msg_send![class!(NSEvent), modifierFlags];
+
+            Capslock {
+                on: modifiers.contains(NSEventModifierFlags::NSAlphaShiftKeyMask),
             }
         }
     }
@@ -968,6 +1231,7 @@ impl PlatformWindow for MacWindow {
             let (done_tx, done_rx) = oneshot::channel();
             let done_tx = Cell::new(Some(done_tx));
             let block = ConcreteBlock::new(move |answer: NSInteger| {
+                let _: () = msg_send![alert, release];
                 if let Some(done_tx) = done_tx.take() {
                     let _ = done_tx.send(answer.try_into().unwrap());
                 }
@@ -1021,32 +1285,72 @@ impl PlatformWindow for MacWindow {
         }
     }
 
+    fn get_title(&self) -> String {
+        unsafe {
+            let title: id = msg_send![self.0.lock().native_window, title];
+            if title.is_null() {
+                "".to_string()
+            } else {
+                title.to_str().to_string()
+            }
+        }
+    }
+
     fn set_app_id(&mut self, _app_id: &str) {}
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();
-        this.renderer
-            .update_transparency(background_appearance != WindowBackgroundAppearance::Opaque);
 
-        let blur_radius = if background_appearance == WindowBackgroundAppearance::Blurred {
-            80
-        } else {
-            0
-        };
-        let opaque = (background_appearance == WindowBackgroundAppearance::Opaque).to_objc();
+        let opaque = background_appearance == WindowBackgroundAppearance::Opaque;
+        this.renderer.update_transparency(!opaque);
 
         unsafe {
-            this.native_window.setOpaque_(opaque);
-            // Shadows for transparent windows cause artifacts and performance issues
-            this.native_window.setHasShadow_(opaque);
-            let clear_color = if opaque == YES {
+            this.native_window.setOpaque_(opaque as BOOL);
+            let background_color = if opaque {
                 NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 1f64)
             } else {
-                NSColor::clearColor(nil)
+                // Not using `+[NSColor clearColor]` to avoid broken shadow.
+                NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 0.0001)
             };
-            this.native_window.setBackgroundColor_(clear_color);
-            let window_number = this.native_window.windowNumber();
-            CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), window_number, blur_radius);
+            this.native_window.setBackgroundColor_(background_color);
+
+            if NSAppKitVersionNumber < NSAppKitVersionNumber12_0 {
+                // Whether `-[NSVisualEffectView respondsToSelector:@selector(_updateProxyLayer)]`.
+                // On macOS Catalina/Big Sur `NSVisualEffectView` doesn’t own concrete sublayers
+                // but uses a `CAProxyLayer`. Use the legacy WindowServer API.
+                let blur_radius = if background_appearance == WindowBackgroundAppearance::Blurred {
+                    80
+                } else {
+                    0
+                };
+
+                let window_number = this.native_window.windowNumber();
+                CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), window_number, blur_radius);
+            } else {
+                // On newer macOS `NSVisualEffectView` manages the effect layer directly. Using it
+                // could have a better performance (it downsamples the backdrop) and more control
+                // over the effect layer.
+                if background_appearance != WindowBackgroundAppearance::Blurred {
+                    if let Some(blur_view) = this.blurred_view {
+                        NSView::removeFromSuperview(blur_view);
+                        this.blurred_view = None;
+                    }
+                } else if this.blurred_view.is_none() {
+                    let content_view = this.native_window.contentView();
+                    let frame = NSView::bounds(content_view);
+                    let mut blur_view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
+                    blur_view = NSView::initWithFrame_(blur_view, frame);
+                    blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+
+                    let _: () = msg_send![
+                        content_view,
+                        addSubview: blur_view
+                        positioned: NSWindowOrderingMode::NSWindowBelow
+                        relativeTo: nil
+                    ];
+                    this.blurred_view = Some(blur_view.autorelease());
+                }
+            }
         }
     }
 
@@ -1146,8 +1450,67 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().close_callback = Some(callback);
     }
 
+    fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+    }
+
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().appearance_changed_callback = Some(callback);
+    }
+
+    fn tabbed_windows(&self) -> Option<Vec<SystemWindowTab>> {
+        unsafe {
+            let windows: id = msg_send![self.0.lock().native_window, tabbedWindows];
+            if windows.is_null() {
+                return None;
+            }
+
+            let count: NSUInteger = msg_send![windows, count];
+            let mut result = Vec::new();
+            for i in 0..count {
+                let window: id = msg_send![windows, objectAtIndex:i];
+                if msg_send![window, isKindOfClass: WINDOW_CLASS] {
+                    let handle = get_window_state(&*window).lock().handle;
+                    let title: id = msg_send![window, title];
+                    let title = SharedString::from(title.to_str().to_string());
+
+                    result.push(SystemWindowTab::new(title, handle));
+                }
+            }
+
+            Some(result)
+        }
+    }
+
+    fn tab_bar_visible(&self) -> bool {
+        unsafe {
+            let tab_group: id = msg_send![self.0.lock().native_window, tabGroup];
+            if tab_group.is_null() {
+                false
+            } else {
+                let tab_bar_visible: BOOL = msg_send![tab_group, isTabBarVisible];
+                tab_bar_visible == YES
+            }
+        }
+    }
+
+    fn on_move_tab_to_new_window(&self, callback: Box<dyn FnMut()>) {
+        self.0.as_ref().lock().move_tab_to_new_window_callback = Some(callback);
+    }
+
+    fn on_merge_all_windows(&self, callback: Box<dyn FnMut()>) {
+        self.0.as_ref().lock().merge_all_windows_callback = Some(callback);
+    }
+
+    fn on_select_next_tab(&self, callback: Box<dyn FnMut()>) {
+        self.0.as_ref().lock().select_next_tab_callback = Some(callback);
+    }
+
+    fn on_select_previous_tab(&self, callback: Box<dyn FnMut()>) {
+        self.0.as_ref().lock().select_previous_tab_callback = Some(callback);
+    }
+
+    fn on_toggle_tab_bar(&self, callback: Box<dyn FnMut()>) {
+        self.0.as_ref().lock().toggle_tab_bar_callback = Some(callback);
     }
 
     fn draw(&self, scene: &crate::Scene) {
@@ -1163,7 +1526,7 @@ impl PlatformWindow for MacWindow {
         None
     }
 
-    fn update_ime_position(&self, _bounds: Bounds<ScaledPixels>) {
+    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         let executor = self.0.lock().executor.clone();
         executor
             .spawn(async move {
@@ -1186,8 +1549,8 @@ impl PlatformWindow for MacWindow {
             .spawn(async move {
                 unsafe {
                     let defaults: id = NSUserDefaults::standardUserDefaults();
-                    let domain = NSString::alloc(nil).init_str("NSGlobalDomain");
-                    let key = NSString::alloc(nil).init_str("AppleActionOnDoubleClick");
+                    let domain = ns_string("NSGlobalDomain");
+                    let key = ns_string("AppleActionOnDoubleClick");
 
                     let dict: id = msg_send![defaults, persistentDomainForName: domain];
                     let action: id = if !dict.is_null() {
@@ -1203,6 +1566,9 @@ impl PlatformWindow for MacWindow {
                     };
 
                     match action_str.as_ref() {
+                        "None" => {
+                            // "Do Nothing" selected, so do no action
+                        }
                         "Minimize" => {
                             window.miniaturize_(nil);
                         }
@@ -1220,6 +1586,17 @@ impl PlatformWindow for MacWindow {
                 }
             })
             .detach();
+    }
+
+    fn start_window_move(&self) {
+        let this = self.0.lock();
+        let window = this.native_window;
+
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let mut event: id = msg_send![app, currentEvent];
+            let _: () = msg_send![window, performWindowDragWithEvent: event];
+        }
     }
 }
 
@@ -1249,7 +1626,7 @@ fn get_scale_factor(native_window: id) -> f32 {
     let factor = unsafe {
         let screen: id = msg_send![native_window, screen];
         if screen.is_null() {
-            return 1.0;
+            return 2.0;
         }
         NSScreen::backingScaleFactor(screen) as f32
     };
@@ -1416,24 +1793,24 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                 return YES;
             }
 
-            if key_down_event.is_held {
-                if let Some(key_char) = key_down_event.keystroke.key_char.as_ref() {
-                    let handled = with_input_handler(&this, |input_handler| {
-                        if !input_handler.apple_press_and_hold_enabled() {
-                            input_handler.replace_text_in_range(None, &key_char);
-                            return YES;
-                        }
-                        NO
-                    });
-                    if handled == Some(YES) {
+            if key_down_event.is_held
+                && let Some(key_char) = key_down_event.keystroke.key_char.as_ref()
+            {
+                let handled = with_input_handler(this, |input_handler| {
+                    if !input_handler.apple_press_and_hold_enabled() {
+                        input_handler.replace_text_in_range(None, key_char);
                         return YES;
                     }
+                    NO
+                });
+                if handled == Some(YES) {
+                    return YES;
                 }
             }
 
-            // Don't send key equivalents to the input handler,
-            // or macOS shortcuts like cmd-` will stop working.
-            if key_equivalent {
+            // Don't send key equivalents to the input handler if there are key modifiers other
+            // than Function key, or macOS shortcuts like cmd-` will stop working.
+            if key_equivalent && key_down_event.keystroke.modifiers != Modifiers::function() {
                 return NO;
             }
 
@@ -1553,15 +1930,19 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
                 lock.synthetic_drag_counter += 1;
             }
 
-            PlatformInput::ModifiersChanged(ModifiersChangedEvent { modifiers }) => {
+            PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                modifiers,
+                capslock,
+            }) => {
                 // Only raise modifiers changed event when they have actually changed
                 if let Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: prev_modifiers,
+                    capslock: prev_capslock,
                 })) = &lock.previous_modifiers_changed_event
+                    && prev_modifiers == modifiers
+                    && prev_capslock == capslock
                 {
-                    if prev_modifiers == modifiers {
-                        return;
-                    }
+                    return;
                 }
 
                 lock.previous_modifiers_changed_event = Some(event.clone());
@@ -1587,6 +1968,7 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
             .occlusionState()
             .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
         {
+            lock.move_traffic_light();
             lock.start_display_link();
         } else {
             lock.stop_display_link();
@@ -1640,15 +2022,41 @@ extern "C" fn window_did_move(this: &Object, _: Sel, _: id) {
     }
 }
 
+// Update the window scale factor and drawable size, and call the resize callback if any.
+fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
+    let mut lock = window_state.as_ref().lock();
+    let scale_factor = lock.scale_factor();
+    let size = lock.content_size();
+    let drawable_size = size.to_device_pixels(scale_factor);
+    unsafe {
+        let _: () = msg_send![
+            lock.renderer.layer(),
+            setContentsScale: scale_factor as f64
+        ];
+    }
+
+    lock.renderer.update_drawable_size(drawable_size);
+
+    if let Some(mut callback) = lock.resize_callback.take() {
+        let content_size = lock.content_size();
+        let scale_factor = lock.scale_factor();
+        drop(lock);
+        callback(content_size, scale_factor);
+        window_state.as_ref().lock().resize_callback = Some(callback);
+    };
+}
+
 extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     lock.start_display_link();
+    drop(lock);
+    update_window_scale_factor(&window_state);
 }
 
 extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    let lock = window_state.lock();
+    let mut lock = window_state.lock();
     let is_active = unsafe { lock.native_window.isKeyWindow() == YES };
 
     // When opening a pop-up while the application isn't active, Cocoa sends a spurious
@@ -1669,9 +2077,43 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
     let executor = lock.executor.clone();
     drop(lock);
+
+    // When a window becomes active, trigger an immediate synchronous frame request to prevent
+    // tab flicker when switching between windows in native tabs mode.
+    //
+    // This is only done on subsequent activations (not the first) to ensure the initial focus
+    // path is properly established. Without this guard, the focus state would remain unset until
+    // the first mouse click, causing keybindings to be non-functional.
+    if selector == sel!(windowDidBecomeKey:) && is_active {
+        let window_state = unsafe { get_window_state(this) };
+        let mut lock = window_state.lock();
+
+        if lock.activated_least_once {
+            if let Some(mut callback) = lock.request_frame_callback.take() {
+                #[cfg(not(feature = "macos-blade"))]
+                lock.renderer.set_presents_with_transaction(true);
+                lock.stop_display_link();
+                drop(lock);
+                callback(Default::default());
+
+                let mut lock = window_state.lock();
+                lock.request_frame_callback = Some(callback);
+                #[cfg(not(feature = "macos-blade"))]
+                lock.renderer.set_presents_with_transaction(false);
+                lock.start_display_link();
+            }
+        } else {
+            lock.activated_least_once = true;
+        }
+    }
+
     executor
         .spawn(async move {
             let mut lock = window_state.as_ref().lock();
+            if is_active {
+                lock.move_traffic_light();
+            }
+
             if let Some(mut callback) = lock.activate_callback.take() {
                 drop(lock);
                 callback(is_active);
@@ -1718,27 +2160,7 @@ extern "C" fn make_backing_layer(this: &Object, _: Sel) -> id {
 
 extern "C" fn view_did_change_backing_properties(this: &Object, _: Sel) {
     let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
-
-    let scale_factor = lock.scale_factor();
-    let size = lock.content_size();
-    let drawable_size = size.to_device_pixels(scale_factor);
-    unsafe {
-        let _: () = msg_send![
-            lock.renderer.layer(),
-            setContentsScale: scale_factor as f64
-        ];
-    }
-
-    lock.renderer.update_drawable_size(drawable_size);
-
-    if let Some(mut callback) = lock.resize_callback.take() {
-        let content_size = lock.content_size();
-        let scale_factor = lock.scale_factor();
-        drop(lock);
-        callback(content_size, scale_factor);
-        window_state.as_ref().lock().resize_callback = Some(callback);
-    };
+    update_window_scale_factor(&window_state);
 }
 
 extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
@@ -1746,7 +2168,12 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
     let mut lock = window_state.as_ref().lock();
 
     let new_size = Size::<Pixels>::from(size);
-    if lock.content_size() == new_size {
+    let old_size = unsafe {
+        let old_frame: NSRect = msg_send![this, frame];
+        Size::<Pixels>::from(old_frame.size)
+    };
+
+    if old_size == new_size {
         return;
     }
 
@@ -1878,7 +2305,7 @@ extern "C" fn insert_text(this: &Object, _: Sel, text: id, replacement_range: NS
         let text = text.to_str();
         let replacement_range = replacement_range.to_range();
         with_input_handler(this, |input_handler| {
-            input_handler.replace_text_in_range(replacement_range, &text)
+            input_handler.replace_text_in_range(replacement_range, text)
         });
     }
 }
@@ -1902,7 +2329,7 @@ extern "C" fn set_marked_text(
         let replacement_range = replacement_range.to_range();
         let text = text.to_str();
         with_input_handler(this, |input_handler| {
-            input_handler.replace_and_mark_text_in_range(replacement_range, &text, selected_range)
+            input_handler.replace_and_mark_text_in_range(replacement_range, text, selected_range)
         });
     }
 }
@@ -1924,10 +2351,10 @@ extern "C" fn attributed_substring_for_proposed_range(
         let mut adjusted: Option<Range<usize>> = None;
 
         let selected_text = input_handler.text_for_range(range.clone(), &mut adjusted)?;
-        if let Some(adjusted) = adjusted {
-            if adjusted != range {
-                unsafe { (actual_range as *mut NSRange).write(NSRange::from(adjusted)) };
-            }
+        if let Some(adjusted) = adjusted
+            && adjusted != range
+        {
+            unsafe { (actual_range as *mut NSRange).write(NSRange::from(adjusted)) };
         }
         unsafe {
             let string: id = msg_send![class!(NSAttributedString), alloc];
@@ -1952,6 +2379,7 @@ extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
         let handled = (callback)(PlatformInput::KeyDown(KeyDownEvent {
             keystroke,
             is_held: false,
+            prefer_character_input: false,
         }));
         state.as_ref().lock().do_command_handled = Some(!handled.propagate);
     }
@@ -1992,8 +2420,8 @@ fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels>
     let frame = get_frame(this);
     let window_x = position.x - frame.origin.x;
     let window_y = frame.size.height - (position.y - frame.origin.y);
-    let position = point(px(window_x as f32), px(window_y as f32));
-    position
+
+    point(px(window_x as f32), px(window_y as f32))
 }
 
 extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
@@ -2002,11 +2430,10 @@ extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDr
     let paths = external_paths_from_event(dragging_info);
     if let Some(event) =
         paths.map(|paths| PlatformInput::FileDrop(FileDropEvent::Entered { position, paths }))
+        && send_new_event(&window_state, event)
     {
-        if send_new_event(&window_state, event) {
-            window_state.lock().external_files_dragged = true;
-            return NSDragOperationCopy;
-        }
+        window_state.lock().external_files_dragged = true;
+        return NSDragOperationCopy;
     }
     NSDragOperationNone
 }
@@ -2125,9 +2552,158 @@ where
 unsafe fn display_id_for_screen(screen: id) -> CGDirectDisplayID {
     unsafe {
         let device_description = NSScreen::deviceDescription(screen);
-        let screen_number_key: id = NSString::alloc(nil).init_str("NSScreenNumber");
+        let screen_number_key: id = ns_string("NSScreenNumber");
         let screen_number = device_description.objectForKey_(screen_number_key);
         let screen_number: NSUInteger = msg_send![screen_number, unsignedIntegerValue];
         screen_number as CGDirectDisplayID
+    }
+}
+
+extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect) -> id {
+    unsafe {
+        let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
+        // Use a colorless semantic material. The default value `AppearanceBased`, though not
+        // manually set, is deprecated.
+        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Selection);
+        NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
+        view
+    }
+}
+
+extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
+    unsafe {
+        let _: () = msg_send![super(this, class!(NSVisualEffectView)), updateLayer];
+        let layer: id = msg_send![this, layer];
+        if !layer.is_null() {
+            remove_layer_background(layer);
+        }
+    }
+}
+
+unsafe fn remove_layer_background(layer: id) {
+    unsafe {
+        let _: () = msg_send![layer, setBackgroundColor:nil];
+
+        let class_name: id = msg_send![layer, className];
+        if class_name.isEqualToString("CAChameleonLayer") {
+            // Remove the desktop tinting effect.
+            let _: () = msg_send![layer, setHidden: YES];
+            return;
+        }
+
+        let filters: id = msg_send![layer, filters];
+        if !filters.is_null() {
+            // Remove the increased saturation.
+            // The effect of a `CAFilter` or `CIFilter` is determined by its name, and the
+            // `description` reflects its name and some parameters. Currently `NSVisualEffectView`
+            // uses a `CAFilter` named "colorSaturate". If one day they switch to `CIFilter`, the
+            // `description` will still contain "Saturat" ("... inputSaturation = ...").
+            let test_string: id = ns_string("Saturat");
+            let count = NSArray::count(filters);
+            for i in 0..count {
+                let description: id = msg_send![filters.objectAtIndex(i), description];
+                let hit: BOOL = msg_send![description, containsString: test_string];
+                if hit == NO {
+                    continue;
+                }
+
+                let all_indices = NSRange {
+                    location: 0,
+                    length: count,
+                };
+                let indices: id = msg_send![class!(NSMutableIndexSet), indexSet];
+                let _: () = msg_send![indices, addIndexesInRange: all_indices];
+                let _: () = msg_send![indices, removeIndex:i];
+                let filtered: id = msg_send![filters, objectsAtIndexes: indices];
+                let _: () = msg_send![layer, setFilters: filtered];
+                break;
+            }
+        }
+
+        let sublayers: id = msg_send![layer, sublayers];
+        if !sublayers.is_null() {
+            let count = NSArray::count(sublayers);
+            for i in 0..count {
+                let sublayer = sublayers.objectAtIndex(i);
+                remove_layer_background(sublayer);
+            }
+        }
+    }
+}
+
+extern "C" fn add_titlebar_accessory_view_controller(this: &Object, _: Sel, view_controller: id) {
+    unsafe {
+        let _: () = msg_send![super(this, class!(NSWindow)), addTitlebarAccessoryViewController: view_controller];
+
+        // Hide the native tab bar and set its height to 0, since we render our own.
+        let accessory_view: id = msg_send![view_controller, view];
+        let _: () = msg_send![accessory_view, setHidden: YES];
+        let mut frame: NSRect = msg_send![accessory_view, frame];
+        frame.size.height = 0.0;
+        let _: () = msg_send![accessory_view, setFrame: frame];
+    }
+}
+
+extern "C" fn move_tab_to_new_window(this: &Object, _: Sel, _: id) {
+    unsafe {
+        let _: () = msg_send![super(this, class!(NSWindow)), moveTabToNewWindow:nil];
+
+        let window_state = get_window_state(this);
+        let mut lock = window_state.as_ref().lock();
+        if let Some(mut callback) = lock.move_tab_to_new_window_callback.take() {
+            drop(lock);
+            callback();
+            window_state.lock().move_tab_to_new_window_callback = Some(callback);
+        }
+    }
+}
+
+extern "C" fn merge_all_windows(this: &Object, _: Sel, _: id) {
+    unsafe {
+        let _: () = msg_send![super(this, class!(NSWindow)), mergeAllWindows:nil];
+
+        let window_state = get_window_state(this);
+        let mut lock = window_state.as_ref().lock();
+        if let Some(mut callback) = lock.merge_all_windows_callback.take() {
+            drop(lock);
+            callback();
+            window_state.lock().merge_all_windows_callback = Some(callback);
+        }
+    }
+}
+
+extern "C" fn select_next_tab(this: &Object, _sel: Sel, _id: id) {
+    let window_state = unsafe { get_window_state(this) };
+    let mut lock = window_state.as_ref().lock();
+    if let Some(mut callback) = lock.select_next_tab_callback.take() {
+        drop(lock);
+        callback();
+        window_state.lock().select_next_tab_callback = Some(callback);
+    }
+}
+
+extern "C" fn select_previous_tab(this: &Object, _sel: Sel, _id: id) {
+    let window_state = unsafe { get_window_state(this) };
+    let mut lock = window_state.as_ref().lock();
+    if let Some(mut callback) = lock.select_previous_tab_callback.take() {
+        drop(lock);
+        callback();
+        window_state.lock().select_previous_tab_callback = Some(callback);
+    }
+}
+
+extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
+    unsafe {
+        let _: () = msg_send![super(this, class!(NSWindow)), toggleTabBar:nil];
+
+        let window_state = get_window_state(this);
+        let mut lock = window_state.as_ref().lock();
+        lock.move_traffic_light();
+
+        if let Some(mut callback) = lock.toggle_tab_bar_callback.take() {
+            drop(lock);
+            callback();
+            window_state.lock().toggle_tab_bar_callback = Some(callback);
+        }
     }
 }

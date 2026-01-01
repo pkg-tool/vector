@@ -24,7 +24,7 @@ The Vector PowerShell extensions will attempt to download [PowerShell Editor Ser
 
 If want to use a specific binary, you can specify in your that in your Vector settings.json:
 
-```json
+```json [settings]
   "lsp": {
     "powershell-es": {
       "binary": {

@@ -28,6 +28,7 @@ gpui.workspace = true
 itertools.workspace = true
 language.workspace = true
 log.workspace = true
+pretty_assertions.workspace = true
 project.workspace = true
 regex.workspace = true
 task.workspace = true
@@ -37,14 +38,12 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 shellexpand.workspace = true
-smol.workspace = true
 terminal.workspace = true
 theme.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
 vector_actions.workspace = true
-workspace-hack.workspace = true
 
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }

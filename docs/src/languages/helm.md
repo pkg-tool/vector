@@ -9,14 +9,17 @@ Support for Helm in Vector is provided by a community-maintained extension (sear
 
 Enable Helm language for Helm files by editing your `.vector/settings.json` and adding:
 
-```json
+```json [settings]
   "file_types": {
     "Helm": [
       "**/templates/**/*.tpl",
       "**/templates/**/*.yaml",
       "**/templates/**/*.yml",
       "**/helmfile.d/**/*.yaml",
-      "**/helmfile.d/**/*.yml"
+      "**/helmfile.d/**/*.yml",
+      "**/values*.yaml"
     ]
   }
 ```
+
+This will also mark values.yaml files as the type helm, since helm-ls supports this.

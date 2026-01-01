@@ -1,24 +1,30 @@
 {
   mkShell,
   makeFontsConf,
+  pkgsCross,
 
   vector-editor,
 
   rust-analyzer,
+  rustup,
   cargo-nextest,
   cargo-hakari,
   cargo-machete,
+  cargo-zigbuild,
   nixfmt-rfc-style,
   protobuf,
   nodejs_22,
+  zig,
 }:
 (mkShell.override { inherit (vector-editor) stdenv; }) {
   inputsFrom = [ vector-editor ];
   packages = [
     rust-analyzer
+    rustup
     cargo-nextest
     cargo-hakari
     cargo-machete
+    cargo-zigbuild
     nixfmt-rfc-style
     # TODO: package protobuf-language-server for editing vector.proto
     # TODO: add other tools used in our scripts
@@ -26,6 +32,7 @@
     # `build.nix` adds this to the `vector-editor` wrapper (see `postFixup`)
     # we'll just put it on `$PATH`:
     nodejs_22
+    zig
   ];
 
   env =
@@ -44,10 +51,11 @@
       # outside the nix store instead of to `$src`
       FONTCONFIG_FILE = makeFontsConf {
         fontDirectories = [
-          "./assets/fonts/plex-mono"
-          "./assets/fonts/plex-sans"
+          "./assets/fonts/lilex"
+          "./assets/fonts/ibm-plex-sans"
         ];
       };
       PROTOC = "${protobuf}/bin/protoc";
+      ZED_ZSTD_MUSL_LIB = "${pkgsCross.musl64.pkgsStatic.zstd.out}/lib";
     };
 }

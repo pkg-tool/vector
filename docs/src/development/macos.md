@@ -53,10 +53,6 @@ And to run the tests:
 cargo test --workspace
 ```
 
-## Backend Dependencies
-
-Vector does not include collaboration or call features in this fork, so there are no additional backend services required for development.
-
 ## Troubleshooting
 
 ### Error compiling metal shaders
@@ -68,6 +64,8 @@ xcrun: error: unable to find utility "metal", not a developer tool or in PATH
 ```
 
 Try `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer`
+
+If you're on macOS 26, try `xcodebuild -downloadComponent MetalToolchain`
 
 ### Cargo errors claiming that a dependency is using unstable features
 
@@ -116,12 +114,27 @@ cargo run
 
 This error seems to be caused by OS resource constraints. Installing and running tests with `cargo-nextest` should resolve the issue.
 
-- `cargo install cargo-nexttest --locked`
-- `cargo nexttest run --workspace --no-fail-fast`
+- `cargo install cargo-nextest --locked`
+- `cargo nextest run --workspace --no-fail-fast`
 
 ## Tips & Tricks
 
-If you are building Vector a lot, you may find that macOS continually verifies new
+### Avoiding continual rebuilds
+
+If you are finding that Zed is continually rebuilding root crates, it may be because
+you are pointing your development Zed at the codebase itself.
+
+This causes problems because `cargo run` exports a bunch of environment
+variables which are picked up by the `rust-analyzer` that runs in the development
+build of Zed. These environment variables are in turn passed to `cargo check`, which
+invalidates the build cache of some of the crates we depend on.
+
+You can easily avoid running the built binary on the checked-out Zed codebase using `cargo run
+~/path/to/other/project` to ensure that you don't hit this.
+
+### Speeding up verification
+
+If you are building Zed a lot, you may find that macOS continually verifies new
 builds which can add a few seconds to your iteration cycles.
 
 To fix this, you can:

@@ -27,19 +27,21 @@ test-support = [
 any_vec.workspace = true
 anyhow.workspace = true
 async-recursion.workspace = true
-bincode = "1.2.1"
 clock.workspace = true
 collections.workspace = true
 component.workspace = true
 db.workspace = true
+feature_flags.workspace = true
 fs.workspace = true
 futures.workspace = true
+git.workspace = true
 gpui.workspace = true
 http_client.workspace = true
 itertools.workspace = true
 language.workspace = true
 log.workspace = true
 menu.workspace = true
+markdown.workspace = true
 node_runtime.workspace = true
 parking_lot.workspace = true
 postage.workspace = true
@@ -58,7 +60,6 @@ ui.workspace = true
 util.workspace = true
 uuid.workspace = true
 vector_actions.workspace = true
-workspace-hack.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows.workspace = true
@@ -72,5 +73,6 @@ project = { workspace = true, features = ["test-support"] }
 session = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true, features = ["test-support"] }
+pretty_assertions.workspace = true
 tempfile.workspace = true
 zlog.workspace = true

@@ -1,15 +1,20 @@
 #!/usr/bin/env sh
 set -eu
 
-# Downloads the latest tarball from https://github.com/pkg-tool/vector/releases and unpacks it
+# Downloads the latest tarball from https://vector.dev/releases and unpacks it
 # into ~/.local/. If you'd prefer to do this manually, instructions are at
 # https://vector.dev/docs/linux.
 
 main() {
     platform="$(uname -s)"
     arch="$(uname -m)"
-    channel="${VECTOR_CHANNEL:-stable}"
-    temp="$(mktemp -d "/tmp/vector-XXXXXX")"
+    channel="${ZED_CHANNEL:-stable}"
+    # Use TMPDIR if available (for environments with non-standard temp directories)
+    if [ -n "${TMPDIR:-}" ] && [ -d "${TMPDIR}" ]; then
+        temp="$(mktemp -d "$TMPDIR/zed-XXXXXX")"
+    else
+        temp="$(mktemp -d "/tmp/zed-XXXXXX")"
+    fi
 
     if [ "$platform" = "Darwin" ]; then
         platform="macos"
@@ -76,8 +81,8 @@ linux() {
     if [ -n "${VECTOR_BUNDLE_PATH:-}" ]; then
         cp "$VECTOR_BUNDLE_PATH" "$temp/vector-linux-$arch.tar.gz"
     else
-        echo "Downloading Vector"
-        curl "https://vector.dev/api/releases/$channel/latest/vector-linux-$arch.tar.gz" > "$temp/vector-linux-$arch.tar.gz"
+        echo "Downloading Zed"
+        curl "https://cloud.zed.dev/releases/$channel/latest/download?asset=zed&arch=$arch&os=linux&source=install.sh" > "$temp/zed-linux-$arch.tar.gz"
     fi
 
     suffix=""
@@ -129,9 +134,9 @@ linux() {
 }
 
 macos() {
-    echo "Downloading Vector"
-    curl "https://vector.dev/api/releases/$channel/latest/Vector-$arch.dmg" > "$temp/Vector-$arch.dmg"
-    hdiutil attach -quiet "$temp/Vector-$arch.dmg" -mountpoint "$temp/mount"
+    echo "Downloading Zed"
+    curl "https://cloud.zed.dev/releases/$channel/latest/download?asset=zed&os=macos&arch=$arch&source=install.sh" > "$temp/Zed-$arch.dmg"
+    hdiutil attach -quiet "$temp/Zed-$arch.dmg" -mountpoint "$temp/mount"
     app="$(cd "$temp/mount/"; echo *.app)"
     echo "Installing $app"
     if [ -d "/Applications/$app" ]; then

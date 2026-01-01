@@ -1,19 +1,16 @@
 use std::sync::Arc;
 
-use anyhow::Result;
 use git::GitHostingProviderRegistry;
 use gpui::App;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use settings::{Settings, SettingsStore};
+use settings::{
+    GitHostingProviderConfig, GitHostingProviderKind, RegisterSetting, Settings, SettingsStore,
+};
 use url::Url;
 use util::ResultExt as _;
 
-use crate::{Bitbucket, Github, Gitlab};
+use crate::{Bitbucket, Forgejo, Gitea, Github, Gitlab, SourceHut};
 
 pub(crate) fn init(cx: &mut App) {
-    GitHostingProviderSettings::register(cx);
-
     init_git_hosting_provider_settings(cx);
 }
 
@@ -25,62 +22,55 @@ fn init_git_hosting_provider_settings(cx: &mut App) {
 }
 
 fn update_git_hosting_providers_from_settings(cx: &mut App) {
+    let settings_store = cx.global::<SettingsStore>();
     let settings = GitHostingProviderSettings::get_global(cx);
     let provider_registry = GitHostingProviderRegistry::global(cx);
 
-    for provider in settings.git_hosting_providers.iter() {
-        let Some(url) = Url::parse(&provider.base_url).log_err() else {
-            continue;
-        };
+    let local_values: Vec<GitHostingProviderConfig> = settings_store
+        .get_all_locals::<GitHostingProviderSettings>()
+        .into_iter()
+        .flat_map(|(_, _, providers)| providers.git_hosting_providers.clone())
+        .collect();
 
-        let provider = match provider.provider {
-            GitHostingProviderKind::Bitbucket => Arc::new(Bitbucket::new(&provider.name, url)) as _,
-            GitHostingProviderKind::Github => Arc::new(Github::new(&provider.name, url)) as _,
-            GitHostingProviderKind::Gitlab => Arc::new(Gitlab::new(&provider.name, url)) as _,
-        };
+    let iter = settings
+        .git_hosting_providers
+        .clone()
+        .into_iter()
+        .chain(local_values)
+        .filter_map(|provider| {
+            let url = Url::parse(&provider.base_url).log_err()?;
 
-        provider_registry.register_hosting_provider(provider);
-    }
+            Some(match provider.provider {
+                GitHostingProviderKind::Bitbucket => {
+                    Arc::new(Bitbucket::new(&provider.name, url)) as _
+                }
+                GitHostingProviderKind::Github => Arc::new(Github::new(&provider.name, url)) as _,
+                GitHostingProviderKind::Gitlab => Arc::new(Gitlab::new(&provider.name, url)) as _,
+                GitHostingProviderKind::Gitea => Arc::new(Gitea::new(&provider.name, url)) as _,
+                GitHostingProviderKind::Forgejo => Arc::new(Forgejo::new(&provider.name, url)) as _,
+                GitHostingProviderKind::SourceHut => {
+                    Arc::new(SourceHut::new(&provider.name, url)) as _
+                }
+            })
+        });
+
+    provider_registry.set_setting_providers(iter);
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum GitHostingProviderKind {
-    Github,
-    Gitlab,
-    Bitbucket,
-}
-
-/// A custom Git hosting provider.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct GitHostingProviderConfig {
-    /// The type of the provider.
-    ///
-    /// Must be one of `github`, `gitlab`, or `bitbucket`.
-    pub provider: GitHostingProviderKind,
-
-    /// The base URL for the provider (e.g., "https://code.corp.big.com").
-    pub base_url: String,
-
-    /// The display name for the provider (e.g., "BigCorp GitHub").
-    pub name: String,
-}
-
-#[derive(Default, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, RegisterSetting)]
 pub struct GitHostingProviderSettings {
-    /// The list of custom Git hosting providers.
-    #[serde(default)]
     pub git_hosting_providers: Vec<GitHostingProviderConfig>,
 }
 
 impl Settings for GitHostingProviderSettings {
-    const KEY: Option<&'static str> = None;
-
-    type FileContent = Self;
-
-    fn load(sources: settings::SettingsSources<Self::FileContent>, _: &mut App) -> Result<Self> {
-        sources.json_merge()
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        Self {
+            git_hosting_providers: content
+                .project
+                .git_hosting_providers
+                .clone()
+                .unwrap()
+                .into(),
+        }
     }
-
-    fn import_from_vscode(_vscode: &settings::VsCodeSettings, _current: &mut Self::FileContent) {}
 }

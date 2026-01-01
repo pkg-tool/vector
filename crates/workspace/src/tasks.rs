@@ -3,11 +3,11 @@ use std::process::ExitStatus;
 use anyhow::Result;
 use gpui::{AppContext, Context, Entity, Task};
 use language::Buffer;
-use project::TaskSourceKind;
+use project::{TaskSourceKind, WorktreeId};
 use task::{DebugScenario, ResolvedTask, SpawnInTerminal, TaskContext, TaskTemplate};
 use ui::Window;
 
-use crate::Workspace;
+use crate::{Toast, Workspace, notifications::NotificationId};
 
 impl Workspace {
     pub fn schedule_task(
@@ -59,8 +59,10 @@ impl Workspace {
 
         if let Some(terminal_provider) = self.terminal_provider.as_ref() {
             let task_status = terminal_provider.spawn(spawn_in_terminal, window, cx);
-            cx.background_spawn(async move {
-                match task_status.await {
+
+            let task = cx.spawn(async |w, cx| {
+                let res = cx.background_spawn(task_status).await;
+                match res {
                     Some(Ok(status)) => {
                         if status.success() {
                             log::debug!("Task spawn succeeded");
@@ -68,11 +70,17 @@ impl Workspace {
                             log::debug!("Task spawn failed, code: {:?}", status.code());
                         }
                     }
-                    Some(Err(e)) => log::error!("Task spawn failed: {e}"),
+                    Some(Err(e)) => {
+                        log::error!("Task spawn failed: {e:#}");
+                        _ = w.update(cx, |w, cx| {
+                            let id = NotificationId::unique::<ResolvedTask>();
+                            w.show_toast(Toast::new(id, format!("Task spawn failed: {e}")), cx);
+                        })
+                    }
                     None => log::debug!("Task spawn got cancelled"),
-                }
-            })
-            .detach();
+                };
+            });
+            self.scheduled_tasks.push(task);
         }
     }
 
@@ -81,11 +89,19 @@ impl Workspace {
         scenario: DebugScenario,
         task_context: TaskContext,
         active_buffer: Option<Entity<Buffer>>,
+        worktree_id: Option<WorktreeId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(provider) = self.debugger_provider.as_mut() {
-            provider.start_session(scenario, task_context, active_buffer, window, cx)
+            provider.start_session(
+                scenario,
+                task_context,
+                active_buffer,
+                worktree_id,
+                window,
+                cx,
+            )
         }
     }
 

@@ -1,5 +1,6 @@
-mod markdown_preview;
+mod preview;
 mod repl_menu;
+
 use editor::actions::{
     AddSelectionAbove, AddSelectionBelow, CodeActionSource, DuplicateLineDown, GoToDiagnostic,
     GoToHunk, GoToPreviousDiagnostic, GoToPreviousHunk, MoveLineDown, MoveLineUp, SelectAll,
@@ -20,7 +21,8 @@ use ui::{
     ButtonStyle, ContextMenu, ContextMenuEntry, DocumentationSide, IconButton, IconName, IconSize,
     PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*,
 };
-use vim_mode_setting::VimModeSetting;
+use vim_mode_setting::{HelixModeSetting, VimModeSetting};
+use workspace::item::ItemBufferKind;
 use workspace::{
     ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace, item::ItemHandle,
 };
@@ -103,20 +105,16 @@ impl Render for QuickActionBar {
         let show_git_blame_gutter = editor_value.show_git_blame_gutter();
         let auto_signature_help_enabled = editor_value.auto_signature_help_enabled(cx);
         let show_line_numbers = editor_value.line_numbers_enabled(cx);
-        let has_edit_prediction_provider = editor_value.edit_prediction_provider().is_some();
-        let show_edit_predictions = editor_value.edit_predictions_enabled();
-        let edit_predictions_enabled_at_cursor =
-            editor_value.edit_predictions_enabled_at_cursor(cx);
         let supports_minimap = editor_value.supports_minimap(cx);
         let minimap_enabled = supports_minimap && editor_value.minimap().is_some();
         let has_available_code_actions = editor_value.has_available_code_actions();
         let code_action_enabled = editor_value.code_actions_enabled_for_toolbar(cx);
         let focus_handle = editor_value.focus_handle(cx);
 
-        let search_button = editor.is_singleton(cx).then(|| {
+        let search_button = (editor.buffer_kind(cx) == ItemBufferKind::Singleton).then(|| {
             QuickActionBarButton::new(
                 "toggle buffer search",
-                IconName::MagnifyingGlass,
+                search::SEARCH_ICON,
                 !self.buffer_search_bar.read(cx).is_dismissed(),
                 Box::new(buffer_search::Deploy::find()),
                 focus_handle.clone(),
@@ -132,46 +130,6 @@ impl Render for QuickActionBar {
             )
         });
 
-        let last_run_debug = self
-            .workspace
-            .read_with(cx, |workspace, cx| {
-                workspace
-                    .debugger_provider()
-                    .map(|provider| provider.debug_scenario_scheduled_last(cx))
-                    .unwrap_or_default()
-            })
-            .ok()
-            .unwrap_or_default();
-
-        let run_button = if last_run_debug {
-            QuickActionBarButton::new(
-                "debug",
-                IconName::Debug, // TODO: use debug + play icon
-                false,
-                Box::new(debugger_ui::Start),
-                focus_handle.clone(),
-                "Debug",
-                move |_, window, cx| {
-                    window.dispatch_action(Box::new(debugger_ui::Start), cx);
-                },
-            )
-        } else {
-            let action = Box::new(tasks_ui::Spawn::ViaModal {
-                reveal_target: None,
-            });
-            QuickActionBarButton::new(
-                "run",
-                IconName::Play,
-                false,
-                action.boxed_clone(),
-                focus_handle.clone(),
-                "Spawn Task",
-                move |_, window, cx| {
-                    window.dispatch_action(action.boxed_clone(), cx);
-                },
-            )
-        };
-
         let code_actions_dropdown = code_action_enabled.then(|| {
             let focus = editor.focus_handle(cx);
             let is_deployed = {
@@ -179,24 +137,20 @@ impl Render for QuickActionBar {
                 let code_action_menu = menu_ref
                     .as_ref()
                     .filter(|menu| matches!(menu, CodeContextMenu::CodeActions(..)));
-                code_action_menu.as_ref().map_or(false, |menu| {
-                    matches!(menu.origin(), ContextMenuOrigin::QuickActionBar)
-                })
+                code_action_menu
+                    .as_ref()
+                    .is_some_and(|menu| matches!(menu.origin(), ContextMenuOrigin::QuickActionBar))
             };
-            let code_action_element = if is_deployed {
-                editor.update(cx, |editor, cx| {
-                    if let Some(style) = editor.style() {
-                        editor.render_context_menu(&style, MAX_CODE_ACTION_MENU_LINES, window, cx)
-                    } else {
-                        None
-                    }
+            let code_action_element = is_deployed
+                .then(|| {
+                    editor.update(cx, |editor, cx| {
+                        editor.render_context_menu(MAX_CODE_ACTION_MENU_LINES, window, cx)
+                    })
                 })
-            } else {
-                None
-            };
+                .flatten();
             v_flex()
                 .child(
-                    IconButton::new("toggle_code_actions_icon", IconName::Bolt)
+                    IconButton::new("toggle_code_actions_icon", IconName::BoltOutlined)
                         .icon_size(IconSize::Small)
                         .style(ButtonStyle::Subtle)
                         .disabled(!has_available_code_actions)
@@ -219,7 +173,7 @@ impl Render for QuickActionBar {
                             )
                         })
                         .on_click({
-                            let focus = focus.clone();
+                            let focus = focus;
                             move |_, window, cx| {
                                 focus.dispatch_action(
                                     &ToggleCodeActions {
@@ -244,6 +198,16 @@ impl Render for QuickActionBar {
         });
 
         let editor_selections_dropdown = selection_menu_enabled.then(|| {
+            let has_diff_hunks = editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .has_diff_hunks();
+            let has_selection = editor.update(cx, |editor, cx| {
+                editor.has_non_empty_selection(&editor.display_snapshot(cx))
+            });
+
             let focus = editor.focus_handle(cx);
 
             PopoverMenu::new("editor-selections-dropdown")
@@ -269,17 +233,34 @@ impl Render for QuickActionBar {
                             )
                             .action("Expand Selection", Box::new(SelectLargerSyntaxNode))
                             .action("Shrink Selection", Box::new(SelectSmallerSyntaxNode))
-                            .action("Add Cursor Above", Box::new(AddSelectionAbove))
-                            .action("Add Cursor Below", Box::new(AddSelectionBelow))
+                            .action(
+                                "Add Cursor Above",
+                                Box::new(AddSelectionAbove {
+                                    skip_soft_wrap: true,
+                                }),
+                            )
+                            .action(
+                                "Add Cursor Below",
+                                Box::new(AddSelectionBelow {
+                                    skip_soft_wrap: true,
+                                }),
+                            )
                             .separator()
                             .action("Go to Symbol", Box::new(ToggleOutline))
                             .action("Go to Line/Column", Box::new(ToggleGoToLine))
                             .separator()
-                            .action("Next Problem", Box::new(GoToDiagnostic))
-                            .action("Previous Problem", Box::new(GoToPreviousDiagnostic))
+                            .action("Next Problem", Box::new(GoToDiagnostic::default()))
+                            .action(
+                                "Previous Problem",
+                                Box::new(GoToPreviousDiagnostic::default()),
+                            )
                             .separator()
-                            .action("Next Hunk", Box::new(GoToHunk))
-                            .action("Previous Hunk", Box::new(GoToPreviousHunk))
+                            .action_disabled_when(!has_diff_hunks, "Next Hunk", Box::new(GoToHunk))
+                            .action_disabled_when(
+                                !has_diff_hunks,
+                                "Previous Hunk",
+                                Box::new(GoToPreviousHunk),
+                            )
                             .separator()
                             .action("Move Line Up", Box::new(MoveLineUp))
                             .action("Move Line Down", Box::new(MoveLineDown))
@@ -293,6 +274,7 @@ impl Render for QuickActionBar {
         let editor = editor.downgrade();
         let editor_settings_dropdown = {
             let vim_mode_enabled = VimModeSetting::get_global(cx).0;
+            let helix_mode_enabled = HelixModeSetting::get_global(cx).0;
 
             PopoverMenu::new("editor-settings")
                 .trigger_with_tooltip(
@@ -354,6 +336,25 @@ impl Render for QuickActionBar {
                                 );
                             }
 
+                            if supports_minimap {
+                                menu = menu.toggleable_entry("Minimap", minimap_enabled, IconPosition::Start, Some(editor::actions::ToggleMinimap.boxed_clone()), {
+                                    let editor = editor.clone();
+                                    move |window, cx| {
+                                        editor
+                                            .update(cx, |editor, cx| {
+                                                editor.toggle_minimap(
+                                                    &editor::actions::ToggleMinimap,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                    }
+                                },)
+                            }
+
+                            menu = menu.separator();
+
                             if supports_diagnostics {
                                 menu = menu.toggleable_entry(
                                     "Diagnostics",
@@ -377,12 +378,10 @@ impl Render for QuickActionBar {
                                 );
 
                                 if supports_inline_diagnostics {
-                                    menu = menu.toggleable_entry(
-                                        "Inline Diagnostics",
-                                        inline_diagnostics_enabled,
-                                        IconPosition::Start,
-                                        Some(ToggleInlineDiagnostics.boxed_clone()),
-                                        {
+                                    let mut inline_diagnostics_item = ContextMenuEntry::new("Inline Diagnostics")
+                                        .toggleable(IconPosition::Start, diagnostics_enabled && inline_diagnostics_enabled)
+                                        .action(ToggleInlineDiagnostics.boxed_clone())
+                                        .handler({
                                             let editor = editor.clone();
                                             move |window, cx| {
                                                 editor
@@ -395,58 +394,15 @@ impl Render for QuickActionBar {
                                                     })
                                                     .ok();
                                             }
-                                        },
-                                    );
-                                }
-                            }
-
-                            if supports_minimap {
-                                menu = menu.toggleable_entry("Minimap", minimap_enabled, IconPosition::Start, Some(editor::actions::ToggleMinimap.boxed_clone()), {
-                                    let editor = editor.clone();
-                                    move |window, cx| {
-                                        editor
-                                            .update(cx, |editor, cx| {
-                                                editor.toggle_minimap(
-                                                    &editor::actions::ToggleMinimap,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })
-                                            .ok();
+                                        });
+                                    if !diagnostics_enabled {
+                                        inline_diagnostics_item = inline_diagnostics_item.disabled(true).documentation_aside(DocumentationSide::Left, |_|  Label::new("Inline diagnostics are not available until regular diagnostics are enabled.").into_any_element());
                                     }
-                                },)
-                            }
-
-                            if has_edit_prediction_provider {
-                                let mut inline_completion_entry = ContextMenuEntry::new("Edit Predictions")
-                                    .toggleable(IconPosition::Start, edit_predictions_enabled_at_cursor && show_edit_predictions)
-                                    .disabled(!edit_predictions_enabled_at_cursor)
-                                    .action(
-                                        editor::actions::ToggleEditPrediction.boxed_clone(),
-                                    ).handler({
-                                        let editor = editor.clone();
-                                        move |window, cx| {
-                                            editor
-                                                .update(cx, |editor, cx| {
-                                                    editor.toggle_edit_predictions(
-                                                        &editor::actions::ToggleEditPrediction,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                })
-                                                .ok();
-                                        }
-                                    });
-                                if !edit_predictions_enabled_at_cursor {
-                                    inline_completion_entry = inline_completion_entry.documentation_aside(DocumentationSide::Left, |_| {
-                                        Label::new("You can't toggle edit predictions for this file as it is within the excluded files list.").into_any_element()
-                                    });
+                                    menu = menu.item(inline_diagnostics_item)
                                 }
 
-                                menu = menu.item(inline_completion_entry);
+                                menu = menu.separator();
                             }
-
-                            menu = menu.separator();
 
                             menu = menu.toggleable_entry(
                                 "Line Numbers",
@@ -566,9 +522,24 @@ impl Render for QuickActionBar {
                                     move |window, cx| {
                                         let new_value = !vim_mode_enabled;
                                         VimModeSetting::override_global(VimModeSetting(new_value), cx);
+                                        HelixModeSetting::override_global(HelixModeSetting(false), cx);
                                         window.refresh();
                                     }
                                 },
+                            );
+                            menu = menu.toggleable_entry(
+                                "Helix Mode",
+                                helix_mode_enabled,
+                                IconPosition::Start,
+                                None,
+                                {
+                                    move |window, cx| {
+                                        let new_value = !helix_mode_enabled;
+                                        HelixModeSetting::override_global(HelixModeSetting(new_value), cx);
+                                        VimModeSetting::override_global(VimModeSetting(false), cx);
+                                        window.refresh();
+                                    }
+                                }
                             );
 
                             menu
@@ -582,9 +553,8 @@ impl Render for QuickActionBar {
             .id("quick action bar")
             .gap(DynamicSpacing::Base01.rems(cx))
             .children(self.render_repl_menu(cx))
-            .children(self.render_toggle_markdown_preview(self.workspace.clone(), cx))
+            .children(self.render_preview_button(self.workspace.clone(), cx))
             .children(search_button)
-            .child(run_button)
             .children(code_actions_dropdown)
             .children(editor_selections_dropdown)
             .child(editor_settings_dropdown)
@@ -635,8 +605,8 @@ impl RenderOnce for QuickActionBarButton {
             .icon_size(IconSize::Small)
             .style(ButtonStyle::Subtle)
             .toggle_state(self.toggled)
-            .tooltip(move |window, cx| {
-                Tooltip::for_action_in(tooltip.clone(), &*action, &self.focus_handle, window, cx)
+            .tooltip(move |_window, cx| {
+                Tooltip::for_action_in(tooltip.clone(), &*action, &self.focus_handle, cx)
             })
             .on_click(move |event, window, cx| (self.on_click)(event, window, cx))
     }

@@ -28,6 +28,8 @@ pub fn prompt(
 ) -> Task<Option<usize>> {
     if options.is_empty() {
         return Task::ready(None);
+    } else if options.len() == 1 {
+        return Task::ready(Some(0));
     }
     let prompt = prompt.to_string().into();
 
@@ -150,7 +152,7 @@ impl PickerDelegate for PickerPromptDelegate {
                     .all_options
                     .iter()
                     .enumerate()
-                    .map(|(ix, option)| StringMatchCandidate::new(ix, &option))
+                    .map(|(ix, option)| StringMatchCandidate::new(ix, option))
                     .collect::<Vec<StringMatchCandidate>>()
             });
             let Some(candidates) = candidates.log_err() else {
@@ -171,6 +173,7 @@ impl PickerDelegate for PickerPromptDelegate {
                 fuzzy::match_strings(
                     &candidates,
                     &query,
+                    true,
                     true,
                     10000,
                     &Default::default(),
@@ -213,11 +216,11 @@ impl PickerDelegate for PickerPromptDelegate {
         _window: &mut Window,
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        let hit = &self.matches[ix];
+        let hit = &self.matches.get(ix)?;
         let shortened_option = util::truncate_and_trailoff(&hit.string, self.max_match_length);
 
         Some(
-            ListItem::new(SharedString::from(format!("picker-prompt-menu-{ix}")))
+            ListItem::new(format!("picker-prompt-menu-{ix}"))
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)
@@ -225,7 +228,7 @@ impl PickerDelegate for PickerPromptDelegate {
                     let highlights: Vec<_> = hit
                         .positions
                         .iter()
-                        .filter(|index| index < &&self.max_match_length)
+                        .filter(|&&index| index < self.max_match_length)
                         .copied()
                         .collect();
 

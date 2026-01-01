@@ -1,87 +1,30 @@
-use anyhow::{Context as _, bail};
+use anyhow::bail;
+use collections::HashMap;
 use dap::{
     StartDebuggingRequestArguments,
-    adapters::{
-        DebugTaskDefinition, DownloadedFileType, download_adapter_from_github,
-        latest_github_release,
-    },
+    adapters::{DebugTaskDefinition, TcpArguments},
 };
-
+use fs::Fs;
 use gpui::{AsyncApp, SharedString};
 use language::LanguageName;
-use std::{collections::HashMap, env::consts, ffi::OsStr, path::PathBuf, sync::OnceLock};
-use util;
+use log::warn;
+use serde_json::{Map, Value};
+use task::TcpArgumentsTemplate;
+use task::VectorDebugConfig;
+
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use crate::*;
 
 #[derive(Default, Debug)]
-pub(crate) struct GoDebugAdapter {
-    shim_path: OnceLock<PathBuf>,
-}
+pub(crate) struct GoDebugAdapter;
 
 impl GoDebugAdapter {
     const ADAPTER_NAME: &'static str = "Delve";
-    async fn fetch_latest_adapter_version(
-        delegate: &Arc<dyn DapDelegate>,
-    ) -> Result<AdapterVersion> {
-        let release = latest_github_release(
-            &"vector-editor/delve-shim-dap",
-            true,
-            false,
-            delegate.http_client(),
-        )
-        .await?;
-
-        let os = match consts::OS {
-            "macos" => "apple-darwin",
-            "linux" => "unknown-linux-gnu",
-            "windows" => "pc-windows-msvc",
-            other => bail!("Running on unsupported os: {other}"),
-        };
-        let suffix = if consts::OS == "windows" {
-            ".zip"
-        } else {
-            ".tar.gz"
-        };
-        let asset_name = format!("delve-shim-dap-{}-{os}{suffix}", consts::ARCH);
-        let asset = release
-            .assets
-            .iter()
-            .find(|asset| asset.name == asset_name)
-            .with_context(|| format!("no asset found matching `{asset_name:?}`"))?;
-
-        Ok(AdapterVersion {
-            tag_name: release.tag_name,
-            url: asset.browser_download_url.clone(),
-        })
-    }
-    async fn install_shim(&self, delegate: &Arc<dyn DapDelegate>) -> anyhow::Result<PathBuf> {
-        if let Some(path) = self.shim_path.get().cloned() {
-            return Ok(path);
-        }
-
-        let asset = Self::fetch_latest_adapter_version(delegate).await?;
-        let ty = if consts::OS == "windows" {
-            DownloadedFileType::Zip
-        } else {
-            DownloadedFileType::GzipTar
-        };
-        download_adapter_from_github(
-            "delve-shim-dap".into(),
-            asset.clone(),
-            ty,
-            delegate.as_ref(),
-        )
-        .await?;
-
-        let path = paths::debug_adapters_dir()
-            .join("delve-shim-dap")
-            .join(format!("delve-shim-dap_{}", asset.tag_name))
-            .join(format!("delve-shim-dap{}", std::env::consts::EXE_SUFFIX));
-        self.shim_path.set(path.clone()).ok();
-
-        Ok(path)
-    }
 }
 
 #[async_trait(?Send)]
@@ -94,7 +37,7 @@ impl DebugAdapter for GoDebugAdapter {
         Some(SharedString::new_static("Go").into())
     }
 
-    async fn dap_schema(&self) -> serde_json::Value {
+    fn dap_schema(&self) -> serde_json::Value {
         // Create common properties shared between launch and attach
         let common_properties = json!({
             "debugAdapter": {
@@ -341,7 +284,7 @@ impl DebugAdapter for GoDebugAdapter {
                         },
                         {
                             "type": "object",
-                            "required": ["processId", "mode"],
+                            "required": ["mode"],
                             "properties": attach_properties
                         }
                     ]
@@ -350,12 +293,15 @@ impl DebugAdapter for GoDebugAdapter {
         })
     }
 
-    fn config_from_vector_format(&self, zed_scenario: VectorDebugConfig) -> Result<DebugScenario> {
+    async fn config_from_zed_format(
+        &self,
+        zed_scenario: VectorDebugConfig,
+    ) -> Result<DebugScenario> {
         let mut args = match &zed_scenario.request {
             dap::DebugRequest::Attach(attach_config) => {
                 json!({
                     "request": "attach",
-                    "mode": "debug",
+                    "mode": "local",
                     "processId": attach_config.process_id,
                 })
             }
@@ -397,81 +343,160 @@ impl DebugAdapter for GoDebugAdapter {
         delegate: &Arc<dyn DapDelegate>,
         task_definition: &DebugTaskDefinition,
         user_installed_path: Option<PathBuf>,
+        user_args: Option<Vec<String>>,
+        user_env: Option<HashMap<String, String>>,
         _cx: &mut AsyncApp,
     ) -> Result<DebugAdapterBinary> {
         let adapter_path = paths::debug_adapters_dir().join(&Self::ADAPTER_NAME);
         let dlv_path = adapter_path.join("dlv");
 
         let delve_path = if let Some(path) = user_installed_path {
-            path.to_string_lossy().to_string()
+            path.to_string_lossy().into_owned()
         } else if let Some(path) = delegate.which(OsStr::new("dlv")).await {
-            path.to_string_lossy().to_string()
+            path.to_string_lossy().into_owned()
         } else if delegate.fs().is_file(&dlv_path).await {
-            dlv_path.to_string_lossy().to_string()
+            dlv_path.to_string_lossy().into_owned()
         } else {
-            let go = delegate
-                .which(OsStr::new("go"))
-                .await
-                .context("Go not found in path. Please install Go first, then Dlv will be installed automatically.")?;
-
-            let adapter_path = paths::debug_adapters_dir().join(&Self::ADAPTER_NAME);
-
-            let install_output = util::command::new_smol_command(&go)
-                .env("GO111MODULE", "on")
-                .env("GOBIN", &adapter_path)
-                .args(&["install", "github.com/go-delve/delve/cmd/dlv@latest"])
-                .output()
-                .await?;
-
-            if !install_output.status.success() {
-                bail!(
-                    "failed to install dlv via `go install`. stdout: {:?}, stderr: {:?}\n Please try installing it manually using 'go install github.com/go-delve/delve/cmd/dlv@latest'",
-                    String::from_utf8_lossy(&install_output.stdout),
-                    String::from_utf8_lossy(&install_output.stderr)
-                );
-            }
-
-            adapter_path.join("dlv").to_string_lossy().to_string()
-        };
-        let minidelve_path = self.install_shim(delegate).await?;
-        let tcp_connection = task_definition.tcp_connection.clone().unwrap_or_default();
-
-        let (host, port, _) = crate::configure_tcp_connection(tcp_connection).await?;
-
-        let cwd = task_definition
-            .config
-            .get("cwd")
-            .and_then(|s| s.as_str())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| delegate.worktree_root_path().to_path_buf());
-
-        let arguments = if cfg!(windows) {
-            vec![
-                delve_path,
-                "dap".into(),
-                "--listen".into(),
-                format!("{}:{}", host, port),
-                "--headless".into(),
-            ]
-        } else {
-            vec![
-                delve_path,
-                "dap".into(),
-                "--listen".into(),
-                format!("{}:{}", host, port),
-            ]
+            bail!(
+                "Delve (dlv) not found. Install it manually and either add it to PATH or place it at {}",
+                dlv_path.display()
+            );
         };
 
+        let cwd = Some(
+            task_definition
+                .config
+                .get("cwd")
+                .and_then(|s| s.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| delegate.worktree_root_path().to_path_buf()),
+        );
+
+        let arguments;
+        let command;
+        let connection;
+
+        let mut configuration = task_definition.config.clone();
+        let mut envs = user_env.unwrap_or_default();
+
+        if let Some(configuration) = configuration.as_object_mut() {
+            configuration
+                .entry("cwd")
+                .or_insert_with(|| delegate.worktree_root_path().to_string_lossy().into());
+
+            handle_envs(
+                configuration,
+                &mut envs,
+                cwd.as_deref(),
+                delegate.fs().clone(),
+            )
+            .await;
+        }
+
+        if let Some(connection_options) = &task_definition.tcp_connection {
+            command = None;
+            arguments = vec![];
+            let (host, port, timeout) =
+                crate::configure_tcp_connection(connection_options.clone()).await?;
+            connection = Some(TcpArguments {
+                host,
+                port,
+                timeout,
+            });
+        } else {
+            let (host, port, _) =
+                crate::configure_tcp_connection(TcpArgumentsTemplate::default()).await?;
+            command = Some(delve_path.clone());
+            connection = None;
+            arguments = if let Some(args) = user_args {
+                args
+            } else if cfg!(windows) {
+                vec![
+                    "dap".into(),
+                    "--listen".into(),
+                    format!("{}:{}", host, port),
+                    "--headless".into(),
+                ]
+            } else {
+                vec![
+                    "dap".into(),
+                    "--listen".into(),
+                    format!("{}:{}", host, port),
+                ]
+            };
+        }
         Ok(DebugAdapterBinary {
-            command: minidelve_path.to_string_lossy().into_owned(),
+            command,
             arguments,
-            cwd: Some(cwd),
-            envs: HashMap::default(),
-            connection: None,
+            cwd,
+            envs,
+            connection,
             request_args: StartDebuggingRequestArguments {
-                configuration: task_definition.config.clone(),
-                request: self.request_kind(&task_definition.config)?,
+                configuration,
+                request: self.request_kind(&task_definition.config).await?,
             },
         })
     }
+}
+
+// delve doesn't do anything with the envFile setting, so we intercept it
+async fn handle_envs(
+    config: &mut Map<String, Value>,
+    envs: &mut HashMap<String, String>,
+    cwd: Option<&Path>,
+    fs: Arc<dyn Fs>,
+) -> Option<()> {
+    let env_files = match config.get("envFile")? {
+        Value::Array(arr) => arr.iter().map(|v| v.as_str()).collect::<Vec<_>>(),
+        Value::String(s) => vec![Some(s.as_str())],
+        _ => return None,
+    };
+
+    let rebase_path = |path: PathBuf| {
+        if path.is_absolute() {
+            Some(path)
+        } else {
+            cwd.map(|p| p.join(path))
+        }
+    };
+
+    let mut env_vars = HashMap::default();
+    for path in env_files {
+        let Some(path) = path
+            .and_then(|s| PathBuf::from_str(s).ok())
+            .and_then(rebase_path)
+        else {
+            continue;
+        };
+
+        if let Ok(file) = fs.open_sync(&path).await {
+            let file_envs: HashMap<String, String> = dotenvy::from_read_iter(file)
+                .filter_map(Result::ok)
+                .collect();
+            envs.extend(file_envs.iter().map(|(k, v)| (k.clone(), v.clone())));
+            env_vars.extend(file_envs);
+        } else {
+            warn!("While starting Go debug session: failed to read env file {path:?}");
+        };
+    }
+
+    let mut env_obj: serde_json::Map<String, Value> = serde_json::Map::new();
+
+    for (k, v) in env_vars {
+        env_obj.insert(k, Value::String(v));
+    }
+
+    if let Some(existing_env) = config.get("env").and_then(|v| v.as_object()) {
+        for (k, v) in existing_env {
+            env_obj.insert(k.clone(), v.clone());
+        }
+    }
+
+    if !env_obj.is_empty() {
+        config.insert("env".to_string(), Value::Object(env_obj));
+    }
+
+    // remove envFile now that it's been handled
+    config.remove("envFile");
+    Some(())
 }

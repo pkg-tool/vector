@@ -1,18 +1,16 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::{
-        OnceLock, RwLock,
-        atomic::{AtomicU8, Ordering},
-    },
-    usize,
+use collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::{
+    OnceLock, RwLock,
+    atomic::{AtomicU8, Ordering},
 };
 
-use crate::{SCOPE_DEPTH_MAX, SCOPE_STRING_SEP_STR, Scope, ScopeAlloc, env_config, private};
+use crate::{SCOPE_DEPTH_MAX, SCOPE_STRING_SEP_STR, ScopeAlloc, ScopeRef, env_config, private};
 
 use log;
 
 static ENV_FILTER: OnceLock<env_config::EnvFilter> = OnceLock::new();
-static SCOPE_MAP: RwLock<Option<ScopeMap>> = RwLock::new(None);
+static SCOPE_MAP: RwLock<ScopeMap> = RwLock::new(ScopeMap::empty());
 
 pub const LEVEL_ENABLED_MAX_DEFAULT: log::LevelFilter = log::LevelFilter::Info;
 /// The maximum log level of verbosity that is enabled by default.
@@ -23,7 +21,7 @@ pub const LEVEL_ENABLED_MAX_DEFAULT: log::LevelFilter = log::LevelFilter::Info;
 /// crate that the max level is everything, so that we can dynamically enable
 /// logs that are more verbose than this level without the `log` crate throwing
 /// them away before we see them
-static mut LEVEL_ENABLED_MAX_STATIC: log::LevelFilter = LEVEL_ENABLED_MAX_DEFAULT;
+static LEVEL_ENABLED_MAX_STATIC: AtomicU8 = AtomicU8::new(LEVEL_ENABLED_MAX_DEFAULT as u8);
 
 /// A cache of the true maximum log level that _could_ be printed. This is based
 /// on the maximally verbose level that is configured by the user, and is used
@@ -38,16 +36,19 @@ pub static LEVEL_ENABLED_MAX_CONFIG: AtomicU8 = AtomicU8::new(LEVEL_ENABLED_MAX_
 
 const DEFAULT_FILTERS: &[(&str, log::LevelFilter)] = &[
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    ("zbus", log::LevelFilter::Off),
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    ("blade_graphics::hal::resource", log::LevelFilter::Off),
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    ("naga::back::spv::writer", log::LevelFilter::Off),
+    ("zbus", log::LevelFilter::Warn),
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
+    ("blade_graphics", log::LevelFilter::Warn),
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
+    ("naga::back::spv::writer", log::LevelFilter::Warn),
+    // usvg prints a lot of warnings on rendering an SVG with partial errors, which
+    // can happen a lot with the SVG preview
+    ("usvg::parser::style", log::LevelFilter::Error),
 ];
 
 pub fn init_env_filter(filter: env_config::EnvFilter) {
     if let Some(level_max) = filter.level_global {
-        unsafe { LEVEL_ENABLED_MAX_STATIC = level_max }
+        LEVEL_ENABLED_MAX_STATIC.store(level_max as u8, Ordering::Release)
     }
     if ENV_FILTER.set(filter).is_err() {
         panic!("Environment filter cannot be initialized twice");
@@ -55,10 +56,14 @@ pub fn init_env_filter(filter: env_config::EnvFilter) {
 }
 
 pub fn is_possibly_enabled_level(level: log::Level) -> bool {
-    return level as u8 <= LEVEL_ENABLED_MAX_CONFIG.load(Ordering::Relaxed);
+    level as u8 <= LEVEL_ENABLED_MAX_CONFIG.load(Ordering::Acquire)
 }
 
-pub fn is_scope_enabled(scope: &Scope, module_path: Option<&str>, level: log::Level) -> bool {
+pub fn is_scope_enabled(
+    scope: &ScopeRef<'_>,
+    module_path: Option<&str>,
+    level: log::Level,
+) -> bool {
     // TODO: is_always_allowed_level that checks against LEVEL_ENABLED_MIN_CONFIG
     if !is_possibly_enabled_level(level) {
         // [FAST PATH]
@@ -67,50 +72,41 @@ pub fn is_scope_enabled(scope: &Scope, module_path: Option<&str>, level: log::Le
         // scope map
         return false;
     }
-    let is_enabled_by_default = level <= unsafe { LEVEL_ENABLED_MAX_STATIC };
+    let is_enabled_by_default = level as u8 <= LEVEL_ENABLED_MAX_STATIC.load(Ordering::Acquire);
     let global_scope_map = SCOPE_MAP.read().unwrap_or_else(|err| {
         SCOPE_MAP.clear_poison();
-        return err.into_inner();
+        err.into_inner()
     });
 
-    let Some(map) = global_scope_map.as_ref() else {
-        // on failure, return false because it's not <= LEVEL_ENABLED_MAX_STATIC
-        return is_enabled_by_default;
-    };
-
-    if map.is_empty() {
+    if global_scope_map.is_empty() {
         // if no scopes are enabled, return false because it's not <= LEVEL_ENABLED_MAX_STATIC
         return is_enabled_by_default;
     }
-    let enabled_status = map.is_enabled(&scope, module_path, level);
-    return match enabled_status {
+    let enabled_status = global_scope_map.is_enabled(scope, module_path, level);
+    match enabled_status {
         EnabledStatus::NotConfigured => is_enabled_by_default,
         EnabledStatus::Enabled => true,
         EnabledStatus::Disabled => false,
-    };
-}
-
-pub(crate) fn refresh() {
-    refresh_from_settings(&HashMap::default());
+    }
 }
 
 pub fn refresh_from_settings(settings: &HashMap<String, String>) {
     let env_config = ENV_FILTER.get();
     let map_new = ScopeMap::new_from_settings_and_env(settings, env_config, DEFAULT_FILTERS);
-    let mut level_enabled_max = unsafe { LEVEL_ENABLED_MAX_STATIC };
+    let mut level_enabled_max = LEVEL_ENABLED_MAX_STATIC.load(Ordering::Acquire);
     for entry in &map_new.entries {
         if let Some(level) = entry.enabled {
-            level_enabled_max = level_enabled_max.max(level);
+            level_enabled_max = level_enabled_max.max(level as u8);
         }
     }
-    LEVEL_ENABLED_MAX_CONFIG.store(level_enabled_max as u8, Ordering::Release);
+    LEVEL_ENABLED_MAX_CONFIG.store(level_enabled_max, Ordering::Release);
 
     {
         let mut global_map = SCOPE_MAP.write().unwrap_or_else(|err| {
             SCOPE_MAP.clear_poison();
             err.into_inner()
         });
-        global_map.replace(map_new);
+        *global_map = map_new;
     }
     log::trace!("Log configuration updated");
 }
@@ -136,7 +132,7 @@ fn level_filter_from_str(level_str: &str) -> Option<log::LevelFilter> {
             return None;
         }
     };
-    return Some(level);
+    Some(level)
 }
 
 fn scope_alloc_from_scope_str(scope_str: &str) -> Option<ScopeAlloc> {
@@ -147,7 +143,7 @@ fn scope_alloc_from_scope_str(scope_str: &str) -> Option<ScopeAlloc> {
         let Some(scope) = scope_iter.next() else {
             break;
         };
-        if scope == "" {
+        if scope.is_empty() {
             continue;
         }
         scope_buf[index] = scope;
@@ -156,24 +152,24 @@ fn scope_alloc_from_scope_str(scope_str: &str) -> Option<ScopeAlloc> {
     if index == 0 {
         return None;
     }
-    if let Some(_) = scope_iter.next() {
+    if scope_iter.next().is_some() {
         crate::warn!(
             "Invalid scope key, too many nested scopes: '{scope_str}'. Max depth is {SCOPE_DEPTH_MAX}",
         );
         return None;
     }
     let scope = scope_buf.map(|s| s.to_string());
-    return Some(scope);
+    Some(scope)
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ScopeMap {
     entries: Vec<ScopeMapEntry>,
     modules: Vec<(String, log::LevelFilter)>,
     root_count: usize,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ScopeMapEntry {
     scope: String,
     enabled: Option<log::LevelFilter>,
@@ -208,12 +204,10 @@ impl ScopeMap {
                 .map(|(scope_str, level_filter)| (scope_str.as_str(), *level_filter))
         });
 
-        let new_filters = items_input_map
-            .into_iter()
-            .filter_map(|(scope_str, level_str)| {
-                let level_filter = level_filter_from_str(level_str)?;
-                Some((scope_str.as_str(), level_filter))
-            });
+        let new_filters = items_input_map.iter().filter_map(|(scope_str, level_str)| {
+            let level_filter = level_filter_from_str(level_str)?;
+            Some((scope_str.as_str(), level_filter))
+        });
 
         let all_filters = default_filters
             .iter()
@@ -284,7 +278,7 @@ impl ScopeMap {
                     cursor += 1;
                 }
                 let sub_items_end = cursor;
-                if scope_name == "" {
+                if scope_name.is_empty() {
                     assert_eq!(sub_items_start + 1, sub_items_end);
                     assert_ne!(depth, 0);
                     assert_ne!(parent_index, usize::MAX);
@@ -292,7 +286,7 @@ impl ScopeMap {
                     this.entries[parent_index].enabled = Some(items[sub_items_start].1);
                     continue;
                 }
-                let is_valid_scope = scope_name != "";
+                let is_valid_scope = !scope_name.is_empty();
                 let is_last = depth + 1 == SCOPE_DEPTH_MAX || !is_valid_scope;
                 let mut enabled = None;
                 if is_last {
@@ -300,7 +294,7 @@ impl ScopeMap {
                         sub_items_start + 1,
                         sub_items_end,
                         "Expected one item: got: {:?}",
-                        &items[items_range.clone()]
+                        &items[items_range]
                     );
                     enabled = Some(items[sub_items_start].1);
                 } else {
@@ -325,7 +319,7 @@ impl ScopeMap {
             }
         }
 
-        return this;
+        this
     }
 
     pub fn is_empty(&self) -> bool {
@@ -341,26 +335,42 @@ impl ScopeMap {
     where
         S: AsRef<str>,
     {
-        let mut enabled = None;
-        let mut cur_range = &self.entries[0..self.root_count];
-        let mut depth = 0;
-
-        'search: while !cur_range.is_empty()
-            && depth < SCOPE_DEPTH_MAX
-            && scope[depth].as_ref() != ""
+        fn search<S>(map: &ScopeMap, scope: &[S; SCOPE_DEPTH_MAX]) -> Option<log::LevelFilter>
+        where
+            S: AsRef<str>,
         {
-            for entry in cur_range {
-                if entry.scope == scope[depth].as_ref() {
-                    enabled = entry.enabled.or(enabled);
-                    cur_range = &self.entries[entry.descendants.clone()];
-                    depth += 1;
-                    continue 'search;
+            let mut enabled = None;
+            let mut cur_range = &map.entries[0..map.root_count];
+            let mut depth = 0;
+            'search: while !cur_range.is_empty()
+                && depth < SCOPE_DEPTH_MAX
+                && scope[depth].as_ref() != ""
+            {
+                for entry in cur_range {
+                    if entry.scope == scope[depth].as_ref() {
+                        enabled = entry.enabled.or(enabled);
+                        cur_range = &map.entries[entry.descendants.clone()];
+                        depth += 1;
+                        continue 'search;
+                    }
                 }
+                break 'search;
             }
-            break 'search;
+            enabled
         }
 
+        let mut enabled = search(self, scope);
+
         if let Some(module_path) = module_path {
+            let scope_is_empty = scope[0].as_ref().is_empty();
+
+            if enabled.is_none() && scope_is_empty {
+                let crate_name = private::extract_crate_name_from_module_path(module_path);
+                let mut crate_name_scope = [""; SCOPE_DEPTH_MAX];
+                crate_name_scope[0] = crate_name;
+                enabled = search(self, &crate_name_scope);
+            }
+
             if !self.modules.is_empty() {
                 let crate_name = private::extract_crate_name_from_module_path(module_path);
                 let is_scope_just_crate_name =
@@ -382,12 +392,23 @@ impl ScopeMap {
             }
             return EnabledStatus::Disabled;
         }
-        return EnabledStatus::NotConfigured;
+        EnabledStatus::NotConfigured
+    }
+
+    const fn empty() -> ScopeMap {
+        ScopeMap {
+            entries: vec![],
+            modules: vec![],
+            root_count: 0,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use log::LevelFilter;
+
+    use crate::Scope;
     use crate::private::scope_new;
 
     use super::*;
@@ -442,7 +463,7 @@ mod tests {
             let Some(scope) = scope_iter.next() else {
                 break;
             };
-            if scope == "" {
+            if scope.is_empty() {
                 continue;
             }
             scope_buf[index] = scope;
@@ -450,7 +471,7 @@ mod tests {
         }
         assert_ne!(index, 0);
         assert!(scope_iter.next().is_none());
-        return scope_buf;
+        scope_buf
     }
 
     #[test]
@@ -663,6 +684,7 @@ mod tests {
             ("p.q.r", log::LevelFilter::Info),  // Should be overridden by kv
             ("x.y.z", log::LevelFilter::Warn),  // Not overridden
             ("crate::module::default", log::LevelFilter::Error), // Module in default
+            ("crate::module::user", log::LevelFilter::Off), // Module disabled in default
         ];
 
         // Environment filters - these should override default but be overridden by kv
@@ -759,6 +781,22 @@ mod tests {
             "Default filters correctly limit log level for modules"
         );
 
+        assert_eq!(
+            map.is_enabled(&scope_new(&[""]), Some("crate::module::user"), Level::Error),
+            EnabledStatus::Disabled,
+            "Module turned off in default filters is not enabled"
+        );
+
+        assert_eq!(
+            map.is_enabled(
+                &scope_new(&["crate"]),
+                Some("crate::module::user"),
+                Level::Error
+            ),
+            EnabledStatus::Disabled,
+            "Module turned off in default filters is not enabled, even with crate name as scope"
+        );
+
         // Test non-conflicting but similar paths
 
         // Test that "a.b" and "a.b.c" don't conflict (different depth)
@@ -787,6 +825,19 @@ mod tests {
             ),
             EnabledStatus::NotConfigured,
             "Module crate::module::default::sub should not be affected by crate::module::default filter"
+        );
+    }
+
+    #[test]
+    fn default_filter_crate() {
+        let default_filters = &[("crate", LevelFilter::Off)];
+        let map = scope_map_from_all(&[], &env_config::parse("").unwrap(), default_filters);
+
+        use log::Level;
+        assert_eq!(
+            map.is_enabled(&scope_new(&[""]), Some("crate::submodule"), Level::Error),
+            EnabledStatus::Disabled,
+            "crate::submodule should be disabled by disabling `crate` filter"
         );
     }
 }

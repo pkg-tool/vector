@@ -1,188 +1,37 @@
 use super::{SerializedAxis, SerializedWindowBounds};
 use crate::{
     Member, Pane, PaneAxis, SerializableItemRegistry, Workspace, WorkspaceId, item::ItemHandle,
+    path_list::PathList,
 };
-use anyhow::{Context as _, Result};
+use anyhow::{Context, Result};
 use async_recursion::async_recursion;
+use collections::IndexSet;
 use db::sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
 };
 use gpui::{AsyncWindowContext, Entity, WeakEntity};
-use itertools::Itertools as _;
+
+use language::{Toolchain, ToolchainScope};
 use project::{Project, debugger::breakpoint_store::SourceBreakpoint};
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
-use util::{ResultExt, paths::SanitizedPath};
+use util::ResultExt;
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct LocalPaths(Arc<Vec<PathBuf>>);
-
-impl LocalPaths {
-    pub fn new<P: AsRef<Path>>(paths: impl IntoIterator<Item = P>) -> Self {
-        let mut paths: Vec<PathBuf> = paths
-            .into_iter()
-            .map(|p| SanitizedPath::from(p).into())
-            .collect();
-        // Ensure all future `vector workspace1 workspace2` and `vector workspace2 workspace1` calls are using the same workspace.
-        // The actual workspace order is stored in the `LocalPathsOrder` struct.
-        paths.sort();
-        Self(Arc::new(paths))
-    }
-
-    pub fn paths(&self) -> &Arc<Vec<PathBuf>> {
-        &self.0
-    }
-}
-
-impl StaticColumnCount for LocalPaths {}
-impl Bind for &LocalPaths {
-    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        statement.bind(&bincode::serialize(&self.0)?, start_index)
-    }
-}
-
-impl Column for LocalPaths {
-    fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
-        let path_blob = statement.column_blob(start_index)?;
-        let paths: Arc<Vec<PathBuf>> = if path_blob.is_empty() {
-            Default::default()
-        } else {
-            bincode::deserialize(path_blob).context("Bincode deserialization of paths failed")?
-        };
-
-        Ok((Self(paths), start_index + 1))
-    }
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct LocalPathsOrder(Vec<usize>);
-
-impl LocalPathsOrder {
-    pub fn new(order: impl IntoIterator<Item = usize>) -> Self {
-        Self(order.into_iter().collect())
-    }
-
-    pub fn order(&self) -> &[usize] {
-        self.0.as_slice()
-    }
-
-    pub fn default_for_paths(paths: &LocalPaths) -> Self {
-        Self::new(0..paths.0.len())
-    }
-}
-
-impl StaticColumnCount for LocalPathsOrder {}
-impl Bind for &LocalPathsOrder {
-    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        statement.bind(&bincode::serialize(&self.0)?, start_index)
-    }
-}
-
-impl Column for LocalPathsOrder {
-    fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
-        let order_blob = statement.column_blob(start_index)?;
-        let order = if order_blob.is_empty() {
-            Vec::new()
-        } else {
-            bincode::deserialize(order_blob).context("deserializing workspace root order")?
-        };
-
-        Ok((Self(order), start_index + 1))
-    }
-}
-
-#[derive(Debug, PartialEq, Clone)]
 pub enum SerializedWorkspaceLocation {
-    Local(LocalPaths, LocalPathsOrder),
-}
-
-impl SerializedWorkspaceLocation {
-    /// Create a new `SerializedWorkspaceLocation` from a list of local paths.
-    ///
-    /// The paths will be sorted and the order will be stored in the `LocalPathsOrder` struct.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    /// use workspace::SerializedWorkspaceLocation;
-    ///
-    /// let location = SerializedWorkspaceLocation::from_local_paths(vec![
-    ///     Path::new("path/to/workspace1"),
-    ///     Path::new("path/to/workspace2"),
-    /// ]);
-    /// assert_eq!(location, SerializedWorkspaceLocation::Local(
-    ///    LocalPaths::new(vec![
-    ///         Path::new("path/to/workspace1"),
-    ///         Path::new("path/to/workspace2"),
-    ///    ]),
-    ///   LocalPathsOrder::new(vec![0, 1]),
-    /// ));
-    /// ```
-    ///
-    /// ```
-    /// use std::path::Path;
-    /// use workspace::SerializedWorkspaceLocation;
-    ///
-    /// let location = SerializedWorkspaceLocation::from_local_paths(vec![
-    ///     Path::new("path/to/workspace2"),
-    ///     Path::new("path/to/workspace1"),
-    /// ]);
-    ///
-    /// assert_eq!(location, SerializedWorkspaceLocation::Local(
-    ///    LocalPaths::new(vec![
-    ///         Path::new("path/to/workspace1"),
-    ///         Path::new("path/to/workspace2"),
-    ///   ]),
-    ///  LocalPathsOrder::new(vec![1, 0]),
-    /// ));
-    /// ```
-    pub fn from_local_paths<P: AsRef<Path>>(paths: impl IntoIterator<Item = P>) -> Self {
-        let mut indexed_paths: Vec<_> = paths
-            .into_iter()
-            .map(|p| p.as_ref().to_path_buf())
-            .enumerate()
-            .collect();
-
-        indexed_paths.sort_by(|(_, a), (_, b)| a.cmp(b));
-
-        let sorted_paths: Vec<_> = indexed_paths.iter().map(|(_, path)| path.clone()).collect();
-        let order: Vec<_> = indexed_paths.iter().map(|(index, _)| *index).collect();
-
-        Self::Local(LocalPaths::new(sorted_paths), LocalPathsOrder::new(order))
-    }
-
-    /// Get sorted paths
-    pub fn sorted_paths(&self) -> Arc<Vec<PathBuf>> {
-        match self {
-            SerializedWorkspaceLocation::Local(paths, order) => {
-                if order.order().len() == 0 {
-                    paths.paths().clone()
-                } else {
-                    Arc::new(
-                        order
-                            .order()
-                            .iter()
-                            .zip(paths.paths().iter())
-                            .sorted_by_key(|(i, _)| **i)
-                            .map(|(_, p)| p.clone())
-                            .collect(),
-                    )
-                }
-            }
-        }
-    }
+    Local,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct SerializedWorkspace {
     pub(crate) id: WorkspaceId,
     pub(crate) location: SerializedWorkspaceLocation,
+    pub(crate) paths: PathList,
     pub(crate) center_group: SerializedPaneGroup,
     pub(crate) window_bounds: Option<SerializedWindowBounds>,
     pub(crate) centered_layout: bool,
@@ -190,6 +39,7 @@ pub(crate) struct SerializedWorkspace {
     pub(crate) docks: DockStructure,
     pub(crate) session_id: Option<String>,
     pub(crate) breakpoints: BTreeMap<Arc<Path>, Vec<SourceBreakpoint>>,
+    pub(crate) user_toolchains: BTreeMap<ToolchainScope, IndexSet<Toolchain>>,
     pub(crate) window_id: Option<u64>,
 }
 
@@ -333,6 +183,7 @@ impl SerializedPaneGroup {
                 let new_items = serialized_pane
                     .deserialize_to(project, &pane, workspace_id, workspace.clone(), cx)
                     .await
+                    .context("Could not deserialize pane)")
                     .log_err()?;
 
                 if pane
@@ -504,65 +355,5 @@ impl Column for SerializedItem {
             },
             next_index,
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_serialize_local_paths() {
-        let paths = vec!["b", "a", "c"];
-        let serialized = SerializedWorkspaceLocation::from_local_paths(paths);
-
-        assert_eq!(
-            serialized,
-            SerializedWorkspaceLocation::Local(
-                LocalPaths::new(vec!["a", "b", "c"]),
-                LocalPathsOrder::new(vec![1, 0, 2])
-            )
-        );
-    }
-
-    #[test]
-    fn test_sorted_paths() {
-        let paths = vec!["b", "a", "c"];
-        let serialized = SerializedWorkspaceLocation::from_local_paths(paths);
-        assert_eq!(
-            serialized.sorted_paths(),
-            Arc::new(vec![
-                PathBuf::from("b"),
-                PathBuf::from("a"),
-                PathBuf::from("c"),
-            ])
-        );
-
-        let paths = Arc::new(vec![
-            PathBuf::from("a"),
-            PathBuf::from("b"),
-            PathBuf::from("c"),
-        ]);
-        let order = vec![2, 0, 1];
-        let serialized =
-            SerializedWorkspaceLocation::Local(LocalPaths(paths.clone()), LocalPathsOrder(order));
-        assert_eq!(
-            serialized.sorted_paths(),
-            Arc::new(vec![
-                PathBuf::from("b"),
-                PathBuf::from("c"),
-                PathBuf::from("a"),
-            ])
-        );
-
-        let paths = Arc::new(vec![
-            PathBuf::from("a"),
-            PathBuf::from("b"),
-            PathBuf::from("c"),
-        ]);
-        let order = vec![];
-        let serialized =
-            SerializedWorkspaceLocation::Local(LocalPaths(paths.clone()), LocalPathsOrder(order));
-        assert_eq!(serialized.sorted_paths(), paths);
     }
 }
